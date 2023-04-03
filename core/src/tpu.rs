@@ -4,7 +4,7 @@
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
 use {
     crate::{
-        banking_stage::BankingStage,
+        banking_stage::{BankingStage, Scheduler},
         banking_trace::{BankingTracer, TracerThread},
         broadcast_stage::{BroadcastStage, BroadcastStageType, RetransmitSlotsReceiver},
         cluster_info_vote_listener::{
@@ -13,6 +13,7 @@ use {
         },
         fetch_stage::FetchStage,
         find_packet_sender_stake_stage::FindPacketSenderStakeStage,
+        // scheduler::Scheduler,
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
@@ -61,6 +62,7 @@ pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
     vote_sigverify_stage: SigVerifyStage,
+    scheduler: Scheduler,
     banking_stage: BankingStage,
     cluster_info_vote_listener: ClusterInfoVoteListener,
     broadcast_stage: BroadcastStage,
@@ -236,6 +238,8 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
+        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder);
+
         let banking_stage = BankingStage::new(
             cluster_info,
             poh_recorder,
@@ -265,6 +269,7 @@ impl Tpu {
             fetch_stage,
             sigverify_stage,
             vote_sigverify_stage,
+            scheduler,
             banking_stage,
             cluster_info_vote_listener,
             broadcast_stage,
@@ -281,6 +286,7 @@ impl Tpu {
         let results = vec![
             self.fetch_stage.join(),
             self.sigverify_stage.join(),
+            self.scheduler.join(),
             self.vote_sigverify_stage.join(),
             self.cluster_info_vote_listener.join(),
             self.banking_stage.join(),

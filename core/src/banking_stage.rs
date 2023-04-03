@@ -1,7 +1,19 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
-
+use min_max_heap::MinMaxHeap;
+use solana_program_runtime::stable_log::program_data;
+use solana_runtime::transaction_priority_details::GetTransactionPriorityDetails;
+use solana_runtime::{
+    bank::Bank,
+    cost_model::{CostModel, TransactionCost},
+};
+use solana_sdk::transaction::SanitizedTransaction;
+use solana_sdk::{
+    pubkey::Pubkey,
+    transaction::{SanitizedVersionedTransaction, VersionedTransaction},
+};
+use solana_streamer::packet::Packet;
 use {
     self::{
         consumer::Consumer,
@@ -261,6 +273,127 @@ pub struct BatchedTransactionErrorDetails {
 /// Stores the stage's thread handle and output receiver.
 pub struct BankingStage {
     bank_thread_hdls: Vec<JoinHandle<()>>,
+}
+
+pub struct Scheduler {
+    scheduler_thread_hdls: JoinHandle<()>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchPacket {
+    packet: Packet,
+    total_CUs: u64,
+    priority: u64,
+}
+
+impl PartialOrd for SchPacket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SchPacket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+impl Scheduler {
+    pub fn new(
+        non_vote_receiver: &BankingPacketReceiver,
+        poh_recorder: &Arc<RwLock<PohRecorder>>,
+    ) -> Self {
+        let packet_receiver = non_vote_receiver.clone();
+        let poh_recorder = poh_recorder.clone();
+
+        let scheduler_thread_hdls = Builder::new()
+            .name(format!("solSchStg"))
+            .spawn(move || {
+                // let start = Instant::now();
+
+                loop {
+                    // let poh_recorder = poh_recorder.clone();
+                    let packet_batchs = Arc::try_unwrap(
+                        packet_receiver
+                            .recv_timeout(Duration::from_millis(20))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .0;
+
+                    let mut prioritized_buffer = MinMaxHeap::new();
+                    let mut acct_vec = Vec::new();
+                    for batch in packet_batchs {
+                        for packet in &batch {
+                            let versioned_transaction: VersionedTransaction =
+                                packet.deserialize_slice(..).unwrap();
+                            let sanitized_transaction =
+                                SanitizedVersionedTransaction::try_from(versioned_transaction)
+                                    .unwrap();
+
+                            let accts = sanitized_transaction
+                                .get_message()
+                                .message
+                                .static_account_keys();
+                            for pubkey in accts {
+                                acct_vec.push(*pubkey);
+                            }
+
+                            let bank = poh_recorder
+                                .read()
+                                .unwrap()
+                                .bank_start()
+                                .filter(|bank_start| {
+                                    bank_start.should_working_bank_still_be_processing_txs()
+                                })
+                                .unwrap()
+                                .working_bank;
+                            let bank = bank.clone();
+                            let fs = bank.feature_set.as_ref();
+
+                            let tx = SanitizedTransaction::try_new(
+                                sanitized_transaction.clone(),
+                                sanitized_transaction.get_message().message.hash(),
+                                false,
+                                bank.clone().as_ref(),
+                            )
+                            .unwrap();
+
+                            let transaction_cost = CostModel::calculate_cost(&tx, fs);
+                            let total_CUs = transaction_cost.signature_cost
+                                + transaction_cost.write_lock_cost
+                                + transaction_cost.data_bytes_cost
+                                + transaction_cost.builtins_execution_cost
+                                + transaction_cost.bpf_execution_cost;
+
+                            let priority_details =
+                                sanitized_transaction.get_transaction_priority_details();
+                            if priority_details.is_some() {
+                                let sch_packet = SchPacket {
+                                    packet: packet.clone(),
+                                    total_CUs,
+                                    priority: priority_details.unwrap().priority,
+                                };
+                                prioritized_buffer.push(sch_packet);
+                            }
+                        }
+                    }
+
+                    // let elapsed = start.elapsed();
+                    // if elapsed.as_secs() > 1 {
+                    //     println!("hello scheduler stage");
+                    // }
+                }
+            })
+            .unwrap();
+        Self {
+            scheduler_thread_hdls,
+        }
+    }
+
+    pub fn join(self) -> thread::Result<()> {
+        self.scheduler_thread_hdls.join()
+    }
 }
 
 #[derive(Debug, Clone)]
