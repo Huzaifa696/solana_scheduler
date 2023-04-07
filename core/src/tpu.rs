@@ -1,6 +1,8 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
+use std::sync::atomic::AtomicU64;
+
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
 use {
     crate::{
@@ -238,7 +240,9 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder);
+        // atomics for keeping track of buffer status
+        let consumed_buffer_cus: Vec<AtomicU64> = vec![0.into(), 0.into(), 0.into(), 0.into()];
+        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &consumed_buffer_cus);
 
         let banking_stage = BankingStage::new(
             cluster_info,

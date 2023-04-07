@@ -1,13 +1,17 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
+use std::collections::HashMap;
+use std::hash::Hash;
+
 use min_max_heap::MinMaxHeap;
-use solana_program_runtime::stable_log::program_data;
+use solana_perf::packet::PacketBatch;
+use solana_poh::poh_recorder::BankStart;
+use solana_poh::poh_recorder::WorkingBank;
+use solana_runtime::bank::Bank;
+use solana_runtime::cost_model::CostModel;
+use solana_runtime::cost_model::TransactionCost;
 use solana_runtime::transaction_priority_details::GetTransactionPriorityDetails;
-use solana_runtime::{
-    bank::Bank,
-    cost_model::{CostModel, TransactionCost},
-};
 use solana_sdk::transaction::SanitizedTransaction;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -281,8 +285,9 @@ pub struct Scheduler {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SchPacket {
+    transaction: SanitizedVersionedTransaction,
     packet: Packet,
-    total_CUs: u64,
+    total_cu: u64,
     priority: u64,
 }
 
@@ -298,84 +303,78 @@ impl Ord for SchPacket {
     }
 }
 
+const PRIORITIZED_BUFFER_SIZE: usize = 1_000_000;
+const ACCT_ACCESS_LIST_SIZE: usize = 256;
+const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
+// const  PACKET_BATCH_SIZE: usize = 64*64;
+
 impl Scheduler {
     pub fn new(
         non_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
+        consumed_buffer_cus: &Vec<AtomicU64>,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
+        let mut prioritized_buffer: MinMaxHeap<SchPacket> =
+            MinMaxHeap::with_capacity(PRIORITIZED_BUFFER_SIZE);
+        let mut acct_vec: Vec<Pubkey> = Vec::with_capacity(ACCT_ACCESS_LIST_SIZE);
+        let mut acct_lookup_table: HashMap<Pubkey, Vec<(String, u8, u64)>> =
+            HashMap::with_capacity(ACCT_LOOKUP_TABLE_SIZE);
+        let mut lookup_results: Vec<(String, u8, u64)> = Vec::with_capacity(1000);
 
+        // let mut packet_batches: Vec<PacketBatch> = Vec::with_capacity(PACKET_BATCH_SIZE);
         let scheduler_thread_hdls = Builder::new()
             .name(format!("solSchStg"))
             .spawn(move || {
                 // let start = Instant::now();
 
                 loop {
-                    // let poh_recorder = poh_recorder.clone();
-                    let packet_batchs = Arc::try_unwrap(
-                        packet_receiver
-                            .recv_timeout(Duration::from_millis(20))
-                            .unwrap(),
-                    )
-                    .unwrap()
-                    .0;
+                    // packet batches from sigverify stage
+                    let packet_batches = Scheduler::get_packet_batches(&packet_receiver);
 
-                    let mut prioritized_buffer = MinMaxHeap::new();
-                    let mut acct_vec = Vec::new();
-                    for batch in packet_batchs {
+                    for batch in packet_batches {
                         for packet in &batch {
-                            let versioned_transaction: VersionedTransaction =
-                                packet.deserialize_slice(..).unwrap();
+
+                            let working_bank = Scheduler::get_working_bank(&poh_recorder);
+                            let bank;
+                            if working_bank.is_some() {
+                                bank = working_bank.unwrap().working_bank
+                            } else {
+                                continue;
+                            }
+
+                            // extracting data 
                             let sanitized_transaction =
-                                SanitizedVersionedTransaction::try_from(versioned_transaction)
-                                    .unwrap();
+                                Scheduler::get_sanitized_transaction(packet);
+                            let total_cu = Scheduler::get_tx_cost(&bank, &sanitized_transaction);
+                            let priority = Scheduler::get_priority(&sanitized_transaction);
+                            Scheduler::get_accts(&sanitized_transaction, &mut acct_vec);
 
-                            let accts = sanitized_transaction
-                                .get_message()
-                                .message
-                                .static_account_keys();
-                            for pubkey in accts {
-                                acct_vec.push(*pubkey);
+                            let sch_packet = SchPacket {
+                                transaction: sanitized_transaction,
+                                packet: packet.clone(),
+                                total_cu,
+                                priority,
+                            };
+                            prioritized_buffer.push(sch_packet);
+
+                            for acct in &acct_vec {
+                                let entries = acct_lookup_table.get(&acct);
+                                if entries.is_some() {
+                                    for entry in entries.unwrap() {
+                                        lookup_results.push(entry.clone());
+                                    }
+                                }
                             }
 
-                            let bank = poh_recorder
-                                .read()
-                                .unwrap()
-                                .bank_start()
-                                .filter(|bank_start| {
-                                    bank_start.should_working_bank_still_be_processing_txs()
-                                })
-                                .unwrap()
-                                .working_bank;
-                            let bank = bank.clone();
-                            let fs = bank.feature_set.as_ref();
-
-                            let tx = SanitizedTransaction::try_new(
-                                sanitized_transaction.clone(),
-                                sanitized_transaction.get_message().message.hash(),
-                                false,
-                                bank.clone().as_ref(),
-                            )
-                            .unwrap();
-
-                            let transaction_cost = CostModel::calculate_cost(&tx, fs);
-                            let total_CUs = transaction_cost.signature_cost
-                                + transaction_cost.write_lock_cost
-                                + transaction_cost.data_bytes_cost
-                                + transaction_cost.builtins_execution_cost
-                                + transaction_cost.bpf_execution_cost;
-
-                            let priority_details =
-                                sanitized_transaction.get_transaction_priority_details();
-                            if priority_details.is_some() {
-                                let sch_packet = SchPacket {
-                                    packet: packet.clone(),
-                                    total_CUs,
-                                    priority: priority_details.unwrap().priority,
-                                };
-                                prioritized_buffer.push(sch_packet);
+                            // decision unit
+                            for entry in &lookup_results {
+                                // case 1: when no account is found in any thread
                             }
+
+                            lookup_results.clear();
+                            acct_vec.clear();
                         }
                     }
 
@@ -389,6 +388,72 @@ impl Scheduler {
         Self {
             scheduler_thread_hdls,
         }
+    }
+
+    fn get_priority(sanitized_transaction: &SanitizedVersionedTransaction) -> u64 {
+        let tx_priority = sanitized_transaction.get_transaction_priority_details();
+
+        if tx_priority.is_some() {
+            tx_priority.unwrap().priority
+        } else {
+            0
+        }
+    }
+
+    fn get_tx_cost(bank: &Bank, sanitized_transaction: &SanitizedVersionedTransaction) -> u64 {
+        let fs = bank.feature_set.as_ref();
+
+        let tx = SanitizedTransaction::try_new(
+            sanitized_transaction.clone(),
+            sanitized_transaction.get_message().message.hash(),
+            false,
+            bank,
+        )
+        .unwrap();
+
+        let transaction_cost = CostModel::calculate_cost(&tx, fs);
+        let total_cu = transaction_cost.signature_cost
+            + transaction_cost.write_lock_cost
+            + transaction_cost.data_bytes_cost
+            + transaction_cost.builtins_execution_cost
+            + transaction_cost.bpf_execution_cost;
+        total_cu
+    }
+
+    fn get_packet_batches(non_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
+        Arc::try_unwrap(
+            non_vote_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .unwrap(),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn get_sanitized_transaction(packet: &Packet) -> SanitizedVersionedTransaction {
+        let versioned_transaction: VersionedTransaction = packet.deserialize_slice(..).unwrap();
+        SanitizedVersionedTransaction::try_from(versioned_transaction).unwrap()
+    }
+
+    fn get_accts(
+        sanitized_transaction: &SanitizedVersionedTransaction,
+        acct_vec: &mut Vec<Pubkey>,
+    ) {
+        let accts = sanitized_transaction
+            .get_message()
+            .message
+            .static_account_keys();
+        for pubkey in accts {
+            acct_vec.push(*pubkey);
+        }
+    }
+
+    fn get_working_bank(poh_recorder: &Arc<RwLock<PohRecorder>>) -> Option<BankStart> {
+        poh_recorder
+            .read()
+            .unwrap()
+            .bank_start()
+            .filter(|bank_start| bank_start.should_working_bank_still_be_processing_txs())
     }
 
     pub fn join(self) -> thread::Result<()> {
