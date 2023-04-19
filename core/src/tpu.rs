@@ -60,6 +60,27 @@ pub struct TpuSockets {
     pub transactions_forwards_quic: UdpSocket,
 }
 
+pub const BANKING_THREADS: usize = 4;
+
+pub struct buffer_status {
+    pub pushed_cus: Vec<AtomicU64>,
+    pub consumed_cus: Vec<AtomicU64>,
+    pub thread_load_est: Vec<AtomicU64>,
+}
+
+impl buffer_status {
+    fn new(capacity: usize) -> Self {
+        let pushed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
+        let consumed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
+        let thread_load_est: Vec<AtomicU64> = Vec::with_capacity(capacity);
+        buffer_status {
+            pushed_cus,
+            consumed_cus,
+            thread_load_est,
+        }
+    }
+}
+
 pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
@@ -241,8 +262,8 @@ impl Tpu {
         );
 
         // atomics for keeping track of buffer status
-        let consumed_buffer_cus: Vec<AtomicU64> = vec![0.into(), 0.into(), 0.into(), 0.into()];
-        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &consumed_buffer_cus);
+        let buffer_status = Arc::new(buffer_status::new(BANKING_THREADS));
+        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &buffer_status);
 
         let banking_stage = BankingStage::new(
             cluster_info,

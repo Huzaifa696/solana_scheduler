@@ -19,6 +19,8 @@ use solana_sdk::{
     transaction::{SanitizedVersionedTransaction, VersionedTransaction},
 };
 use solana_streamer::packet::Packet;
+
+use crate::tpu::buffer_status;
 use {
     self::{
         consumer::Consumer,
@@ -280,16 +282,33 @@ pub struct BankingStage {
     bank_thread_hdls: Vec<JoinHandle<()>>,
 }
 
+struct lookup_table {
+    acct_lookup: HashMap<Pubkey, (u64, u64, u64, u64)>,
+    lookup_results: Vec<(u64, u64, u64, u64)>,
+}
+
+impl lookup_table {
+    fn new(capacity: usize) -> Self {
+        let acct_lookup: HashMap<Pubkey, (u64, u64, u64, u64)> = HashMap::with_capacity(capacity);
+        let lookup_results: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(capacity / 5);
+        lookup_table {
+            acct_lookup,
+            lookup_results,
+        }
+    }
+}
+
 pub struct Scheduler {
     scheduler_thread_hdls: JoinHandle<()>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct SchPacket {
-    transaction: SanitizedVersionedTransaction,
+    transaction: SanitizedTransaction,
     packet: Packet,
     total_cu: u64,
     priority: u64,
+    accts: Vec<Pubkey>,
 }
 
 impl PartialOrd for SchPacket {
@@ -304,7 +323,7 @@ impl Ord for SchPacket {
     }
 }
 
-const PRIORITIZED_BUFFER_SIZE: usize = 1_000_000;
+const PRIORITIZED_BUFFER_SIZE: usize = 100_000;
 const ACCT_ACCESS_LIST_SIZE: usize = 256;
 const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 // const  PACKET_BATCH_SIZE: usize = 64*64;
@@ -313,18 +332,15 @@ impl Scheduler {
     pub fn new(
         non_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        consumed_buffer_cus: Vec<AtomicU64>,
+        buffer_status: &Arc<buffer_status>,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
-        let consumed_buffer_cus = consumed_buffer_cus;
+        let buffer_status = buffer_status.clone();
+
         let mut prioritized_buffer: MinMaxHeap<SchPacket> =
             MinMaxHeap::with_capacity(PRIORITIZED_BUFFER_SIZE);
-        let mut acct_vec: Vec<Pubkey> = Vec::with_capacity(ACCT_ACCESS_LIST_SIZE);
-        let mut acct_lookup_table: HashMap<Pubkey, (u64, u64, u64, u64)> =
-            HashMap::with_capacity(ACCT_LOOKUP_TABLE_SIZE);
-        let mut lookup_results: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(1000);
-        let mut total_pushed_cus: Vec<AtomicU64> = vec![0.into(), 0.into(), 0.into(), 0.into()];
+        let mut acct_lookup_table = lookup_table::new(ACCT_LOOKUP_TABLE_SIZE);
 
         // let mut packet_batches: Vec<PacketBatch> = Vec::with_capacity(PACKET_BATCH_SIZE);
         let scheduler_thread_hdls = Builder::new()
@@ -337,77 +353,93 @@ impl Scheduler {
                     // packet batches from sigverify stage
                     let packet_batches = Scheduler::get_packet_batches(&packet_receiver);
 
+                    // check if this validator is the current leader
+                    let working_bank = Scheduler::get_working_bank(&poh_recorder);
+                    let bank;
+                    if working_bank.is_some() {
+                        bank = working_bank.unwrap().working_bank
+                    } else {
+                        continue;
+                    }
+
                     for batch in packet_batches {
                         for packet in &batch {
-                            let working_bank = Scheduler::get_working_bank(&poh_recorder);
-                            let bank;
-                            if working_bank.is_some() {
-                                bank = working_bank.unwrap().working_bank
-                            } else {
-                                continue;
-                            }
-
                             // extracting data
-                            let sanitized_transaction =
-                                Scheduler::get_sanitized_transaction(packet);
-                            let total_cu = Scheduler::get_tx_cost(&bank, &sanitized_transaction);
-                            let priority = Scheduler::get_priority(&sanitized_transaction);
-                            Scheduler::get_accts(&sanitized_transaction, &mut acct_vec);
+                            let (sanitized_transaction, total_cu, priority, accts) =
+                                Scheduler::get_tx_meta_info(packet, &bank);
 
-                            let sch_packet = SchPacket {
+                            prioritized_buffer.push(SchPacket {
                                 transaction: sanitized_transaction,
                                 packet: packet.clone(),
                                 total_cu,
                                 priority,
-                            };
-                            prioritized_buffer.push(sch_packet);
+                                accts,
+                            });
 
-                            for acct in &acct_vec {
-                                let entry = acct_lookup_table.get(&acct);
-                                if entry.is_some() {
-                                    lookup_results.push(entry.unwrap().clone());
-                                }
+                            if let Some(sch_packet) = prioritized_buffer.pop_max() {
+                                // Do something with the removed SchPacket
+                                target_thread = Scheduler::get_thread_number(
+                                    sch_packet,
+                                    &mut acct_lookup_table,
+                                    &buffer_status,
+                                );
+                            } else {
+                                // in case the buffer is empty
+                                continue;
                             }
+
+                            // for acct in &acct_vec {
+                            //     let entry = acct_lookup_table.get(&acct);
+                            //     if entry.is_some() {
+                            //         lookup_results.push(entry.unwrap().clone());
+                            //     }
+                            // }
 
                             // decision unit
-
-                            let mut least_loaded_thread: Vec<u64> = vec![0; total_pushed_cus.len()];
+                            // least_loaded_thread.iter_mut().for_each(|x| *x = 0);
                             // case 1: when no account is found in any thread
-                            if lookup_results.is_empty() {
-                                for index in 0..total_pushed_cus.len() {
-                                    least_loaded_thread[index] = total_pushed_cus[index]
-                                        .load(Ordering::Relaxed)
-                                        - consumed_buffer_cus[index].load(Ordering::Relaxed);
-                                }
-                                let (target_thread, _) =
-                                    least_loaded_thread.iter().enumerate().min().unwrap();
-                                acct_vec.clear();
-                                // send sch_packet to target thread
-                                continue;
-                            // case 2: all accts found in one thread
-                            } else {
-                                let max_tuple = lookup_results.iter().fold(
-                                    (0, 0, 0, 0),
-                                    |acc, &(a, b, c, d)| {
-                                        (acc.0.max(a), acc.1.max(b), acc.2.max(c), acc.3.max(d))
-                                    },
-                                );
-                                let my_vec = vec![max_tuple.0, max_tuple.1, max_tuple.2, max_tuple.3];
-                                let (target_thread, _) = my_vec.iter().enumerate().min().unwrap();
-                                
-                                // if buffer is not full 
-                                    // send sch_packet to target thread
-                                // else 
-                                //     send sch_packet to the least loaded thread
-                                acct_vec.clear();
-                                lookup_results.clear();
-                                continue;
-                            }
+                            // if lookup_results.is_empty() {
+                            //     for index in 0..total_pushed_cus.len() {
+                            //         least_loaded_thread[index] = total_pushed_cus[index]
+                            //             .load(Ordering::Relaxed)
+                            //             - consumed_buffer_cus[index].load(Ordering::Relaxed);
+                            //     }
+                            //     let (target_thread, _) =
+                            //         least_loaded_thread.iter().enumerate().min().unwrap();
+                            //     acct_vec.clear();
+                            //     // send sch_packet to target thread
+                            //     continue;
+                            // // case 2: all accts found in one thread
+                            // } else {
+                            //     let max_tuple = lookup_results.iter().fold(
+                            //         (0, 0, 0, 0),
+                            //         |acc, &(a, b, c, d)| {
+                            //             (acc.0.max(a), acc.1.max(b), acc.2.max(c), acc.3.max(d))
+                            //         },
+                            //     );
+                            //     let max_vec =
+                            //         vec![max_tuple.0, max_tuple.1, max_tuple.2, max_tuple.3];
+                            //     let (target_thread, _) = max_vec.iter().enumerate().min().unwrap();
 
-                            for entry in &lookup_results {
-                                // case 1: when no account is found in any thread
-                                if lookup_results.is_empty() {}
-                            }
+                            //     for index in 0..total_pushed_cus.len() {
+                            //         least_loaded_thread[index] = total_pushed_cus[index]
+                            //             .load(Ordering::Relaxed)
+                            //             - consumed_buffer_cus[index].load(Ordering::Relaxed);
+                            //     }
+                            //     if least_loaded_thread.iter().enumerate().min().unwrap().0 == 0 {
+                            //         // send sch_packet to the least loaded thread
+                            //     } else {
+                            //         // send sch_packet to target_thread
+                            //     }
+                            //     acct_vec.clear();
+                            //     lookup_results.clear();
+                            //     continue;
+                            // }
+
+                            // for entry in &lookup_results {
+                            //     // case 1: when no account is found in any thread
+                            //     if lookup_results.is_empty() {}
+                            // }
                         }
                     }
 
@@ -423,6 +455,91 @@ impl Scheduler {
         }
     }
 
+    fn get_thread_number(
+        sch_packet: SchPacket,
+        lookup_table: &mut lookup_table,
+        buffer_status: &buffer_status,
+    ) -> u64 {
+        for acct in &sch_packet.accts {
+            let entry = lookup_table.acct_lookup.get(acct);
+            if entry.is_some() {
+                lookup_table.lookup_results.push(entry.unwrap().clone());
+            }
+        }
+        buffer_status.thread_load_est.iter().map(|x| {
+            x.store(0, Ordering::Relaxed);
+        });
+
+        // case 1: when no account is found in any thread
+        if lookup_table.lookup_results.is_empty() {
+            for index in 0..buffer_status.pushed_cus.len() {
+                let diff = buffer_status.pushed_cus[index].fetch_sub(
+                    buffer_status.consumed_cus[index].load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                buffer_status.thread_load_est[index].store(diff, Ordering::Relaxed);
+            }
+            let target_thread = buffer_status.thread_load_est.iter().map(|x|{
+                x.load(Ordering::Relaxed)
+            }).enumerate().min().unwrap().0;
+
+            sch_packet.accts.iter().map(|acct|{
+                let entry = lookup_table.acct_lookup.get(acct);
+                if entry.is_some() {
+                    let current_threads_highest_val = entry.unwrap().0;
+                }
+            });
+
+            lookup_table.lookup_results.clear();
+
+            target_thread as u64
+
+           
+            // acct_vec.clear();
+            // // send sch_packet to target thread
+            // continue;
+        }
+        else {}
+        // // case 2: all accts found in one thread
+        // } else {
+        //     let max_tuple = lookup_results.iter().fold(
+        //         (0, 0, 0, 0),
+        //         |acc, &(a, b, c, d)| {
+        //             (acc.0.max(a), acc.1.max(b), acc.2.max(c), acc.3.max(d))
+        //         },
+        //     );
+        //     let max_vec =
+        //         vec![max_tuple.0, max_tuple.1, max_tuple.2, max_tuple.3];
+        //     let (target_thread, _) = max_vec.iter().enumerate().min().unwrap();
+
+        //     for index in 0..total_pushed_cus.len() {
+        //         least_loaded_thread[index] = total_pushed_cus[index]
+        //             .load(Ordering::Relaxed)
+        //             - consumed_buffer_cus[index].load(Ordering::Relaxed);
+        //     }
+        //     if least_loaded_thread.iter().enumerate().min().unwrap().0 == 0 {
+        //         // send sch_packet to the least loaded thread
+        //     } else {
+        //         // send sch_packet to target_thread
+        //     }
+        //     acct_vec.clear();
+        //     lookup_results.clear();
+        //     continue;
+        // }
+        // 0
+    }
+
+    fn get_tx_meta_info(
+        packet: &Packet,
+        bank: &Bank,
+    ) -> (SanitizedTransaction, u64, u64, Vec<Pubkey>) {
+        let sanitized_versioned_transaction = Scheduler::get_sanitized_transaction(packet);
+        let (total_cu, tx) = Scheduler::get_tx_and_txcost(&bank, &sanitized_versioned_transaction);
+        let priority = Scheduler::get_priority(&sanitized_versioned_transaction);
+        let accts = Scheduler::get_accts(&sanitized_versioned_transaction);
+        (tx, total_cu, priority, accts)
+    }
+
     fn get_priority(sanitized_transaction: &SanitizedVersionedTransaction) -> u64 {
         let tx_priority = sanitized_transaction.get_transaction_priority_details();
 
@@ -433,7 +550,10 @@ impl Scheduler {
         }
     }
 
-    fn get_tx_cost(bank: &Bank, sanitized_transaction: &SanitizedVersionedTransaction) -> u64 {
+    fn get_tx_and_txcost(
+        bank: &Bank,
+        sanitized_transaction: &SanitizedVersionedTransaction,
+    ) -> (u64, SanitizedTransaction) {
         let fs = bank.feature_set.as_ref();
 
         let tx = SanitizedTransaction::try_new(
@@ -450,7 +570,7 @@ impl Scheduler {
             + transaction_cost.data_bytes_cost
             + transaction_cost.builtins_execution_cost
             + transaction_cost.bpf_execution_cost;
-        total_cu
+        (total_cu, tx)
     }
 
     fn get_packet_batches(non_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
@@ -468,17 +588,12 @@ impl Scheduler {
         SanitizedVersionedTransaction::try_from(versioned_transaction).unwrap()
     }
 
-    fn get_accts(
-        sanitized_transaction: &SanitizedVersionedTransaction,
-        acct_vec: &mut Vec<Pubkey>,
-    ) {
+    fn get_accts(sanitized_transaction: &SanitizedVersionedTransaction) -> Vec<Pubkey> {
         let accts = sanitized_transaction
             .get_message()
             .message
             .static_account_keys();
-        for pubkey in accts {
-            acct_vec.push(*pubkey);
-        }
+        accts.to_vec()
     }
 
     fn get_working_bank(poh_recorder: &Arc<RwLock<PohRecorder>>) -> Option<BankStart> {
