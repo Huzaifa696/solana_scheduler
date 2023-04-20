@@ -21,6 +21,7 @@ use solana_sdk::{
 use solana_streamer::packet::Packet;
 
 use crate::tpu::buffer_status;
+use crate::tpu::buffers;
 use {
     self::{
         consumer::Consumer,
@@ -283,14 +284,14 @@ pub struct BankingStage {
 }
 
 struct lookup_table {
-    acct_lookup: HashMap<Pubkey, (u64, u64, u64, u64)>,
-    lookup_results: Vec<(u64, u64, u64, u64)>,
+    acct_lookup: HashMap<Pubkey, Vec<u64>>,
+    lookup_results: Vec<Vec<u64>>,
 }
 
 impl lookup_table {
     fn new(capacity: usize) -> Self {
-        let acct_lookup: HashMap<Pubkey, (u64, u64, u64, u64)> = HashMap::with_capacity(capacity);
-        let lookup_results: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(capacity / 5);
+        let acct_lookup: HashMap<Pubkey, Vec<u64>> = HashMap::with_capacity(capacity);
+        let lookup_results: Vec<Vec<u64>> = Vec::with_capacity(capacity / 5);
         lookup_table {
             acct_lookup,
             lookup_results,
@@ -302,8 +303,15 @@ pub struct Scheduler {
     scheduler_thread_hdls: JoinHandle<()>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SchPacket {
+pub mod x {
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub struct x {
+        total_cu: u64,
+        priority: u64,
+    } 
+}
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SchPacket {
     transaction: SanitizedTransaction,
     packet: Packet,
     total_cu: u64,
@@ -333,10 +341,12 @@ impl Scheduler {
         non_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         buffer_status: &Arc<buffer_status>,
+        channels: &buffers,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
         let buffer_status = buffer_status.clone();
+        let channels = channels.clone();
 
         let mut prioritized_buffer: MinMaxHeap<SchPacket> =
             MinMaxHeap::with_capacity(PRIORITIZED_BUFFER_SIZE);
@@ -382,6 +392,7 @@ impl Scheduler {
                                     sch_packet,
                                     &mut acct_lookup_table,
                                     &buffer_status,
+                                    &channels
                                 );
                             } else {
                                 // in case the buffer is empty
@@ -459,6 +470,7 @@ impl Scheduler {
         sch_packet: SchPacket,
         lookup_table: &mut lookup_table,
         buffer_status: &buffer_status,
+        channels: &buffers, 
     ) -> u64 {
         for acct in &sch_packet.accts {
             let entry = lookup_table.acct_lookup.get(acct);
@@ -472,34 +484,45 @@ impl Scheduler {
 
         // case 1: when no account is found in any thread
         if lookup_table.lookup_results.is_empty() {
-            for index in 0..buffer_status.pushed_cus.len() {
-                let diff = buffer_status.pushed_cus[index].fetch_sub(
-                    buffer_status.consumed_cus[index].load(Ordering::SeqCst),
-                    Ordering::SeqCst,
-                );
-                buffer_status.thread_load_est[index].store(diff, Ordering::Relaxed);
+            let mut min = usize::MAX;
+            for (sender, _) in channels {
+                if sender.len() < min {
+                    min = sender.len();
+                }   
             }
-            let target_thread = buffer_status.thread_load_est.iter().map(|x|{
-                x.load(Ordering::Relaxed)
-            }).enumerate().min().unwrap().0;
+            // for index in 0..buffer_status.pushed_cus.len() {
+            //     let diff = buffer_status.pushed_cus[index].fetch_sub(
+            //         buffer_status.consumed_cus[index].load(Ordering::SeqCst),
+            //         Ordering::SeqCst,
+            //     );
+            //     buffer_status.thread_load_est[index].store(diff, Ordering::Relaxed);
+            // }
+            // let target_thread = buffer_status
+            //     .thread_load_est
+            //     .iter()
+            //     .map(|x| x.load(Ordering::Relaxed))
+            //     .enumerate()
+            //     .min()
+            //     .unwrap()
+            //     .0;
 
-            sch_packet.accts.iter().map(|acct|{
-                let entry = lookup_table.acct_lookup.get(acct);
-                if entry.is_some() {
-                    let current_threads_highest_val = entry.unwrap().0;
-                }
-            });
+            // sch_packet.accts.iter().map(|acct| {
+            //     let entry = lookup_table.acct_lookup.get(acct);
+            //     if entry.is_some() {
+            //         let current_threads_highest_val = entry.unwrap().0;
+            //     }
+            // });
 
-            lookup_table.lookup_results.clear();
+            // lookup_table.lookup_results.clear();
 
-            target_thread as u64
+            // target_thread as u64
 
-           
             // acct_vec.clear();
             // // send sch_packet to target thread
             // continue;
+        } else {
         }
-        else {}
+        0
         // // case 2: all accts found in one thread
         // } else {
         //     let max_tuple = lookup_results.iter().fold(

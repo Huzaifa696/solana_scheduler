@@ -4,9 +4,11 @@
 use std::sync::atomic::AtomicU64;
 
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
+
+use crate::banking_stage;
 use {
     crate::{
-        banking_stage::{BankingStage, Scheduler},
+        banking_stage::{BankingStage, SchPacket, Scheduler},
         banking_trace::{BankingTracer, TracerThread},
         broadcast_stage::{BroadcastStage, BroadcastStageType, RetransmitSlotsReceiver},
         cluster_info_vote_listener::{
@@ -15,12 +17,11 @@ use {
         },
         fetch_stage::FetchStage,
         find_packet_sender_stake_stage::FindPacketSenderStakeStage,
-        // scheduler::Scheduler,
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
     },
-    crossbeam_channel::{unbounded, Receiver},
+    crossbeam_channel::{bounded, unbounded, Receiver, Sender},
     solana_client::connection_cache::ConnectionCache,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{blockstore::Blockstore, blockstore_processor::TransactionStatusSender},
@@ -81,6 +82,10 @@ impl buffer_status {
     }
 }
 
+struct x {
+    y: u64,
+}
+
 pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
@@ -96,6 +101,8 @@ pub struct Tpu {
     staked_nodes_updater_service: StakedNodesUpdaterService,
     tracer_thread_hdl: TracerThread,
 }
+
+pub type buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
 
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
@@ -263,7 +270,9 @@ impl Tpu {
 
         // atomics for keeping track of buffer status
         let buffer_status = Arc::new(buffer_status::new(BANKING_THREADS));
-        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &buffer_status);
+        let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> =
+            vec![(); BANKING_THREADS].into_iter().map(|_| bounded(32)).collect();
+        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &buffer_status, &channels);
 
         let banking_stage = BankingStage::new(
             cluster_info,
