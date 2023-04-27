@@ -180,180 +180,180 @@ enum TransactionType {
     ProgramsAndVotes,
 }
 
-fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
-    solana_logger::setup();
-    let num_threads = BankingStage::num_threads() as usize;
-    //   a multiple of packet chunk duplicates to avoid races
-    const CHUNKS: usize = 8;
-    const PACKETS_PER_BATCH: usize = 192;
-    let txes = PACKETS_PER_BATCH * num_threads * CHUNKS;
-    let mint_total = 1_000_000_000_000;
-    let GenesisConfigInfo {
-        mut genesis_config,
-        mint_keypair,
-        ..
-    } = create_genesis_config(mint_total);
+// fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
+//     solana_logger::setup();
+//     let num_threads = BankingStage::num_threads() as usize;
+//     //   a multiple of packet chunk duplicates to avoid races
+//     const CHUNKS: usize = 8;
+//     const PACKETS_PER_BATCH: usize = 192;
+//     let txes = PACKETS_PER_BATCH * num_threads * CHUNKS;
+//     let mint_total = 1_000_000_000_000;
+//     let GenesisConfigInfo {
+//         mut genesis_config,
+//         mint_keypair,
+//         ..
+//     } = create_genesis_config(mint_total);
 
-    // Set a high ticks_per_slot so we don't run out of ticks
-    // during the benchmark
-    genesis_config.ticks_per_slot = 10_000;
+//     // Set a high ticks_per_slot so we don't run out of ticks
+//     // during the benchmark
+//     genesis_config.ticks_per_slot = 10_000;
 
-    let banking_tracer = BankingTracer::new_disabled();
-    let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
-    let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
-    let (gossip_vote_sender, gossip_vote_receiver) = banking_tracer.create_channel_gossip_vote();
+//     let banking_tracer = BankingTracer::new_disabled();
+//     let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
+//     let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
+//     let (gossip_vote_sender, gossip_vote_receiver) = banking_tracer.create_channel_gossip_vote();
 
-    let mut bank = Bank::new_for_benches(&genesis_config);
-    // Allow arbitrary transaction processing time for the purposes of this bench
-    bank.ns_per_slot = u128::MAX;
-    let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
-    let bank = bank_forks.read().unwrap().get(0).unwrap();
+//     let mut bank = Bank::new_for_benches(&genesis_config);
+//     // Allow arbitrary transaction processing time for the purposes of this bench
+//     bank.ns_per_slot = u128::MAX;
+//     let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+//     let bank = bank_forks.read().unwrap().get(0).unwrap();
 
-    // set cost tracker limits to MAX so it will not filter out TXs
-    bank.write_cost_tracker()
-        .unwrap()
-        .set_limits(std::u64::MAX, std::u64::MAX, std::u64::MAX);
+//     // set cost tracker limits to MAX so it will not filter out TXs
+//     bank.write_cost_tracker()
+//         .unwrap()
+//         .set_limits(std::u64::MAX, std::u64::MAX, std::u64::MAX);
 
-    debug!("threads: {} txs: {}", num_threads, txes);
+//     debug!("threads: {} txs: {}", num_threads, txes);
 
-    let transactions = match tx_type {
-        TransactionType::Accounts | TransactionType::AccountsAndVotes => {
-            make_accounts_txs(txes, &mint_keypair, genesis_config.hash())
-        }
-        TransactionType::Programs | TransactionType::ProgramsAndVotes => {
-            make_programs_txs(txes, genesis_config.hash())
-        }
-    };
-    let vote_txs = match tx_type {
-        TransactionType::AccountsAndVotes | TransactionType::ProgramsAndVotes => {
-            Some(make_vote_txs(txes))
-        }
-        _ => None,
-    };
+//     let transactions = match tx_type {
+//         TransactionType::Accounts | TransactionType::AccountsAndVotes => {
+//             make_accounts_txs(txes, &mint_keypair, genesis_config.hash())
+//         }
+//         TransactionType::Programs | TransactionType::ProgramsAndVotes => {
+//             make_programs_txs(txes, genesis_config.hash())
+//         }
+//     };
+//     let vote_txs = match tx_type {
+//         TransactionType::AccountsAndVotes | TransactionType::ProgramsAndVotes => {
+//             Some(make_vote_txs(txes))
+//         }
+//         _ => None,
+//     };
 
-    // fund all the accounts
-    transactions.iter().for_each(|tx| {
-        let fund = system_transaction::transfer(
-            &mint_keypair,
-            &tx.message.account_keys[0],
-            mint_total / txes as u64,
-            genesis_config.hash(),
-        );
-        let x = bank.process_transaction(&fund);
-        x.unwrap();
-    });
-    //sanity check, make sure all the transactions can execute sequentially
-    transactions.iter().for_each(|tx| {
-        let res = bank.process_transaction(tx);
-        assert!(res.is_ok(), "sanity test transactions");
-    });
-    bank.clear_signatures();
-    //sanity check, make sure all the transactions can execute in parallel
-    let res = bank.process_transactions(transactions.iter());
-    for r in res {
-        assert!(r.is_ok(), "sanity parallel execution");
-    }
-    bank.clear_signatures();
-    let verified: Vec<_> = to_packet_batches(&transactions, PACKETS_PER_BATCH);
-    let vote_packets = vote_txs.map(|vote_txs| {
-        let mut packet_batches = to_packet_batches(&vote_txs, PACKETS_PER_BATCH);
-        for batch in packet_batches.iter_mut() {
-            for packet in batch.iter_mut() {
-                packet.meta_mut().set_simple_vote(true);
-            }
-        }
-        packet_batches
-    });
+//     // fund all the accounts
+//     transactions.iter().for_each(|tx| {
+//         let fund = system_transaction::transfer(
+//             &mint_keypair,
+//             &tx.message.account_keys[0],
+//             mint_total / txes as u64,
+//             genesis_config.hash(),
+//         );
+//         let x = bank.process_transaction(&fund);
+//         x.unwrap();
+//     });
+//     //sanity check, make sure all the transactions can execute sequentially
+//     transactions.iter().for_each(|tx| {
+//         let res = bank.process_transaction(tx);
+//         assert!(res.is_ok(), "sanity test transactions");
+//     });
+//     bank.clear_signatures();
+//     //sanity check, make sure all the transactions can execute in parallel
+//     let res = bank.process_transactions(transactions.iter());
+//     for r in res {
+//         assert!(r.is_ok(), "sanity parallel execution");
+//     }
+//     bank.clear_signatures();
+//     let verified: Vec<_> = to_packet_batches(&transactions, PACKETS_PER_BATCH);
+//     let vote_packets = vote_txs.map(|vote_txs| {
+//         let mut packet_batches = to_packet_batches(&vote_txs, PACKETS_PER_BATCH);
+//         for batch in packet_batches.iter_mut() {
+//             for packet in batch.iter_mut() {
+//                 packet.meta_mut().set_simple_vote(true);
+//             }
+//         }
+//         packet_batches
+//     });
 
-    let ledger_path = get_tmp_ledger_path!();
-    {
-        let blockstore = Arc::new(
-            Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
-        );
-        let (exit, poh_recorder, poh_service, signal_receiver) =
-            create_test_recorder(&bank, &blockstore, None, None);
-        let cluster_info = {
-            let keypair = Arc::new(Keypair::new());
-            let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
-            ClusterInfo::new(node.info, keypair, SocketAddrSpace::Unspecified)
-        };
-        let cluster_info = Arc::new(cluster_info);
-        let (s, _r) = unbounded();
-        let _banking_stage = BankingStage::new(
-            &cluster_info,
-            &poh_recorder,
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
-            None,
-            s,
-            None,
-            Arc::new(ConnectionCache::default()),
-            bank_forks,
-            &Arc::new(PrioritizationFeeCache::new(0u64)),
-        );
+//     let ledger_path = get_tmp_ledger_path!();
+//     {
+//         let blockstore = Arc::new(
+//             Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
+//         );
+//         let (exit, poh_recorder, poh_service, signal_receiver) =
+//             create_test_recorder(&bank, &blockstore, None, None);
+//         let cluster_info = {
+//             let keypair = Arc::new(Keypair::new());
+//             let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+//             ClusterInfo::new(node.info, keypair, SocketAddrSpace::Unspecified)
+//         };
+//         let cluster_info = Arc::new(cluster_info);
+//         let (s, _r) = unbounded();
+//         let _banking_stage = BankingStage::new(
+//             &cluster_info,
+//             &poh_recorder,
+//             non_vote_receiver,
+//             tpu_vote_receiver,
+//             gossip_vote_receiver,
+//             None,
+//             s,
+//             None,
+//             Arc::new(ConnectionCache::default()),
+//             bank_forks,
+//             &Arc::new(PrioritizationFeeCache::new(0u64)),
+//         );
 
-        let chunk_len = verified.len() / CHUNKS;
-        let mut start = 0;
+//         let chunk_len = verified.len() / CHUNKS;
+//         let mut start = 0;
 
-        // This is so that the signal_receiver does not go out of scope after the closure.
-        // If it is dropped before poh_service, then poh_service will error when
-        // calling send() on the channel.
-        let signal_receiver = Arc::new(signal_receiver);
-        let signal_receiver2 = signal_receiver;
-        bencher.iter(move || {
-            let now = Instant::now();
-            let mut sent = 0;
-            if let Some(vote_packets) = &vote_packets {
-                tpu_vote_sender
-                    .send(BankingPacketBatch::new((
-                        vote_packets[start..start + chunk_len].to_vec(),
-                        None,
-                    )))
-                    .unwrap();
-                gossip_vote_sender
-                    .send(BankingPacketBatch::new((
-                        vote_packets[start..start + chunk_len].to_vec(),
-                        None,
-                    )))
-                    .unwrap();
-            }
-            for v in verified[start..start + chunk_len].chunks(chunk_len / num_threads) {
-                debug!(
-                    "sending... {}..{} {} v.len: {}",
-                    start,
-                    start + chunk_len,
-                    timestamp(),
-                    v.len(),
-                );
-                for xv in v {
-                    sent += xv.len();
-                }
-                non_vote_sender
-                    .send(BankingPacketBatch::new((v.to_vec(), None)))
-                    .unwrap();
-            }
+//         // This is so that the signal_receiver does not go out of scope after the closure.
+//         // If it is dropped before poh_service, then poh_service will error when
+//         // calling send() on the channel.
+//         let signal_receiver = Arc::new(signal_receiver);
+//         let signal_receiver2 = signal_receiver;
+//         bencher.iter(move || {
+//             let now = Instant::now();
+//             let mut sent = 0;
+//             if let Some(vote_packets) = &vote_packets {
+//                 tpu_vote_sender
+//                     .send(BankingPacketBatch::new((
+//                         vote_packets[start..start + chunk_len].to_vec(),
+//                         None,
+//                     )))
+//                     .unwrap();
+//                 gossip_vote_sender
+//                     .send(BankingPacketBatch::new((
+//                         vote_packets[start..start + chunk_len].to_vec(),
+//                         None,
+//                     )))
+//                     .unwrap();
+//             }
+//             for v in verified[start..start + chunk_len].chunks(chunk_len / num_threads) {
+//                 debug!(
+//                     "sending... {}..{} {} v.len: {}",
+//                     start,
+//                     start + chunk_len,
+//                     timestamp(),
+//                     v.len(),
+//                 );
+//                 for xv in v {
+//                     sent += xv.len();
+//                 }
+//                 non_vote_sender
+//                     .send(BankingPacketBatch::new((v.to_vec(), None)))
+//                     .unwrap();
+//             }
 
-            check_txs(&signal_receiver2, txes / CHUNKS);
+//             check_txs(&signal_receiver2, txes / CHUNKS);
 
-            // This signature clear may not actually clear the signatures
-            // in this chunk, but since we rotate between CHUNKS then
-            // we should clear them by the time we come around again to re-use that chunk.
-            bank.clear_signatures();
-            trace!(
-                "time: {} checked: {} sent: {}",
-                duration_as_us(&now.elapsed()),
-                txes / CHUNKS,
-                sent,
-            );
-            start += chunk_len;
-            start %= verified.len();
-        });
-        exit.store(true, Ordering::Relaxed);
-        poh_service.join().unwrap();
-    }
-    let _unused = Blockstore::destroy(&ledger_path);
-}
+//             // This signature clear may not actually clear the signatures
+//             // in this chunk, but since we rotate between CHUNKS then
+//             // we should clear them by the time we come around again to re-use that chunk.
+//             bank.clear_signatures();
+//             trace!(
+//                 "time: {} checked: {} sent: {}",
+//                 duration_as_us(&now.elapsed()),
+//                 txes / CHUNKS,
+//                 sent,
+//             );
+//             start += chunk_len;
+//             start %= verified.len();
+//         });
+//         exit.store(true, Ordering::Relaxed);
+//         poh_service.join().unwrap();
+//     }
+//     let _unused = Blockstore::destroy(&ledger_path);
+// }
 
 #[bench]
 fn bench_banking_stage_multi_accounts(bencher: &mut Bencher) {

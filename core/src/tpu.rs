@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU64;
 
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
 
-use crate::banking_stage;
+// use crate::banking_stage;
 use {
     crate::{
         banking_stage::{BankingStage, SchPacket, Scheduler},
@@ -63,27 +63,23 @@ pub struct TpuSockets {
 
 pub const BANKING_THREADS: usize = 4;
 
-pub struct buffer_status {
+pub struct BufferStatus {
     pub pushed_cus: Vec<AtomicU64>,
     pub consumed_cus: Vec<AtomicU64>,
     pub thread_load_est: Vec<AtomicU64>,
 }
 
-impl buffer_status {
+impl BufferStatus {
     fn new(capacity: usize) -> Self {
         let pushed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
         let consumed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
         let thread_load_est: Vec<AtomicU64> = Vec::with_capacity(capacity);
-        buffer_status {
+        BufferStatus {
             pushed_cus,
             consumed_cus,
             thread_load_est,
         }
     }
-}
-
-struct x {
-    y: u64,
 }
 
 pub struct Tpu {
@@ -102,7 +98,7 @@ pub struct Tpu {
     tracer_thread_hdl: TracerThread,
 }
 
-pub type buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
+pub type Buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
 
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
@@ -269,11 +265,12 @@ impl Tpu {
         );
 
         // atomics for keeping track of buffer status
-        let buffer_status = Arc::new(buffer_status::new(BANKING_THREADS));
+        let buffer_status = Arc::new(BufferStatus::new(BANKING_THREADS));
         let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> =
             vec![(); BANKING_THREADS].into_iter().map(|_| bounded(32)).collect();
         let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &buffer_status, &channels);
 
+        let receivers: Vec<Receiver<SchPacket>> = channels.into_iter().map(|(_, r)| r).collect();
         let banking_stage = BankingStage::new(
             cluster_info,
             poh_recorder,
@@ -286,6 +283,7 @@ impl Tpu {
             connection_cache.clone(),
             bank_forks.clone(),
             prioritization_fee_cache,
+            receivers,
         );
 
         let broadcast_stage = broadcast_type.new_broadcast_stage(
