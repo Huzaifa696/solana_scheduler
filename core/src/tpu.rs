@@ -1,7 +1,6 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
-
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
 
 // use crate::banking_stage;
@@ -244,9 +243,11 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> =
-            vec![(); BANKING_THREADS].into_iter().map(|_| bounded(32)).collect();
-        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &channels);
+        let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> = vec![(); BANKING_THREADS]
+            .into_iter()
+            .map(|_| bounded(32))
+            .collect();
+        let scheduler = Scheduler::new(&non_vote_receiver, &tpu_vote_receiver, poh_recorder, &channels);
 
         let receivers: Vec<Receiver<SchPacket>> = channels.into_iter().map(|(_, r)| r).collect();
         let banking_stage = BankingStage::new(

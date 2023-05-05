@@ -330,6 +330,7 @@ const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 impl Scheduler {
     pub fn new(
         non_vote_receiver: &BankingPacketReceiver,
+        tpu_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         channels: &Buffers,
     ) -> Self {
@@ -366,6 +367,27 @@ impl Scheduler {
                             let (sanitized_transaction, priority, accts) =
                                 Scheduler::get_tx_meta_info(packet, &bank);
 
+                            if sanitized_transaction.is_simple_vote_transaction() {
+                                let sch_packet = SchPacket {
+                                    transaction: sanitized_transaction,
+                                    packet: packet.clone(),
+                                    priority,
+                                    accts,
+                                };
+                                target_thread = Self::find_least_loaded_thread(&channels);
+                                Self::update_lookup_table(
+                                    &mut acct_lookup_table,
+                                    target_thread as u64,
+                                    &sch_packet,
+                                );
+                                let _sending_result = channels
+                                    .get(target_thread as usize)
+                                    .unwrap()
+                                    .0
+                                    .send(sch_packet);
+                                continue;
+                            }
+
                             prioritized_buffer.push(SchPacket {
                                 transaction: sanitized_transaction,
                                 packet: packet.clone(),
@@ -379,7 +401,7 @@ impl Scheduler {
                                     &sch_packet,
                                     &mut acct_lookup_table,
                                     &channels,
-                                );
+                                ) as usize;
 
                                 // send obj to the scheduled thread
                                 let _sending_result = channels
@@ -387,7 +409,6 @@ impl Scheduler {
                                     .unwrap()
                                     .0
                                     .send(sch_packet);
-
                             } else {
                                 // in case the buffer is empty
                                 continue;
@@ -510,7 +531,6 @@ impl Scheduler {
         bank: &Bank,
         sanitized_transaction: &SanitizedVersionedTransaction,
     ) -> SanitizedTransaction {
-
         let tx = SanitizedTransaction::try_new(
             sanitized_transaction.clone(),
             sanitized_transaction.get_message().message.hash(),
@@ -629,7 +649,7 @@ impl BankingStage {
         // This thread talks to poh_service and broadcasts the entries once they have been recorded.
         // Once an entry has been recorded, its blockhash is registered with the bank.
         let data_budget = Arc::new(DataBudget::default());
-        let _receivers = Arc::new(receivers);
+        let receivers = Arc::new(receivers);
         let batch_limit =
             TOTAL_BUFFERED_PACKETS / ((num_threads - NUM_VOTE_PROCESSING_THREADS) as usize);
         // Keeps track of extraneous vote transactions for the vote threads
@@ -640,14 +660,35 @@ impl BankingStage {
                 // let x = &receivers;
                 let (packet_receiver, unprocessed_transaction_storage) = match id {
                     0 => (
-                        tpu_vote_receiver.clone(),
+                        receivers.get(0).clone(),
                         UnprocessedTransactionStorage::new_transaction_storage(
                             UnprocessedPacketBatches::with_capacity(batch_limit),
                             ThreadType::Voting(VoteSource::Tpu),
                         ),
                     ),
+                    1 => (
+                        receivers.get(1).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
+                    2 => (
+                        receivers.get(2).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
+                    3 => (
+                        receivers.get(3).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
                     _ => (
-                        non_vote_receiver.clone(),
+                        receivers.get(0).clone(),
                         UnprocessedTransactionStorage::new_transaction_storage(
                             UnprocessedPacketBatches::with_capacity(batch_limit),
                             ThreadType::Transactions,
@@ -655,40 +696,43 @@ impl BankingStage {
                     ),
                 };
 
-                let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
+                // let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
                 let poh_recorder = poh_recorder.clone();
 
-                let committer = Committer::new(
-                    transaction_status_sender.clone(),
-                    replay_vote_sender.clone(),
-                    prioritization_fee_cache.clone(),
-                );
-                let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
-                let forwarder = Forwarder::new(
-                    poh_recorder.clone(),
-                    bank_forks.clone(),
-                    cluster_info.clone(),
-                    connection_cache.clone(),
-                    data_budget.clone(),
-                );
-                let consumer = Consumer::new(
-                    committer,
-                    poh_recorder.read().unwrap().new_recorder(),
-                    QosService::new(id),
-                    log_messages_bytes_limit,
-                );
+                // let committer = Committer::new(
+                //     transaction_status_sender.clone(),
+                //     replay_vote_sender.clone(),
+                //     prioritization_fee_cache.clone(),
+                // );
+                // let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
+                // let forwarder = Forwarder::new(
+                //     poh_recorder.clone(),
+                //     bank_forks.clone(),
+                //     cluster_info.clone(),
+                //     connection_cache.clone(),
+                //     data_budget.clone(),
+                // );
+                // let consumer = Consumer::new(
+                //     committer,
+                //     poh_recorder.read().unwrap().new_recorder(),
+                //     QosService::new(id),
+                //     log_messages_bytes_limit,
+                // );
 
                 Builder::new()
                     .name(format!("solBanknStgTx{id:02}"))
                     .spawn(move || {
-                        Self::process_loop(
-                            &mut packet_receiver,
-                            &decision_maker,
-                            &forwarder,
-                            &consumer,
-                            id,
-                            unprocessed_transaction_storage,
-                        );
+                        loop {
+                            print!("hello");
+                        }
+                        // Self::process_loop(
+                        //     &mut packet_receiver,
+                        //     &decision_maker,
+                        //     &forwarder,
+                        //     &consumer,
+                        //     id,
+                        //     unprocessed_transaction_storage,
+                        // );
                     })
                     .unwrap()
             })
