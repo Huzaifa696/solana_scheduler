@@ -10,7 +10,6 @@ use solana_poh::poh_recorder::BankStart;
 // use solana_poh::poh_recorder::WorkingBank;
 // use solana_program_runtime::executor_cache::MAX_CACHED_EXECUTORS;
 use solana_runtime::bank::Bank;
-use solana_runtime::cost_model::CostModel;
 // use solana_runtime::cost_model::TransactionCost;
 use solana_runtime::transaction_priority_details::GetTransactionPriorityDetails;
 use solana_sdk::transaction::SanitizedTransaction;
@@ -20,7 +19,6 @@ use solana_sdk::{
 };
 use solana_streamer::packet::Packet;
 
-use crate::tpu::BufferStatus;
 use crate::tpu::Buffers;
 use crate::tpu::BANKING_THREADS;
 use {
@@ -308,7 +306,6 @@ pub struct Scheduler {
 pub struct SchPacket {
     transaction: SanitizedTransaction,
     packet: Packet,
-    total_cu: u64,
     priority: u64,
     accts: Vec<Pubkey>,
 }
@@ -333,20 +330,18 @@ const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 impl Scheduler {
     pub fn new(
         non_vote_receiver: &BankingPacketReceiver,
+        tpu_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        buffer_status: &Arc<BufferStatus>,
         channels: &Buffers,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
-        let buffer_status = buffer_status.clone();
         let channels = channels.clone();
 
         let mut prioritized_buffer: MinMaxHeap<SchPacket> =
             MinMaxHeap::with_capacity(PRIORITIZED_BUFFER_SIZE);
         let mut acct_lookup_table = LookupTable::new(ACCT_LOOKUP_TABLE_SIZE);
 
-        // let mut packet_batches: Vec<PacketBatch> = Vec::with_capacity(PACKET_BATCH_SIZE);
         let scheduler_thread_hdls = Builder::new()
             .name(format!("solSchStg"))
             .spawn(move || {
@@ -369,13 +364,33 @@ impl Scheduler {
                     for batch in packet_batches {
                         for packet in &batch {
                             // extracting data
-                            let (sanitized_transaction, total_cu, priority, accts) =
+                            let (sanitized_transaction, priority, accts) =
                                 Scheduler::get_tx_meta_info(packet, &bank);
+
+                            if sanitized_transaction.is_simple_vote_transaction() {
+                                let sch_packet = SchPacket {
+                                    transaction: sanitized_transaction,
+                                    packet: packet.clone(),
+                                    priority,
+                                    accts,
+                                };
+                                target_thread = Self::find_least_loaded_thread(&channels);
+                                Self::update_lookup_table(
+                                    &mut acct_lookup_table,
+                                    target_thread as u64,
+                                    &sch_packet,
+                                );
+                                let _sending_result = channels
+                                    .get(target_thread as usize)
+                                    .unwrap()
+                                    .0
+                                    .send(sch_packet);
+                                continue;
+                            }
 
                             prioritized_buffer.push(SchPacket {
                                 transaction: sanitized_transaction,
                                 packet: packet.clone(),
-                                total_cu,
                                 priority,
                                 accts,
                             });
@@ -385,9 +400,8 @@ impl Scheduler {
                                 target_thread = Scheduler::get_thread_number(
                                     &sch_packet,
                                     &mut acct_lookup_table,
-                                    &buffer_status,
                                     &channels,
-                                );
+                                ) as usize;
 
                                 // send obj to the scheduled thread
                                 let _sending_result = channels
@@ -395,8 +409,6 @@ impl Scheduler {
                                     .unwrap()
                                     .0
                                     .send(sch_packet);
-
-                            // update the lookup table
                             } else {
                                 // in case the buffer is empty
                                 continue;
@@ -416,13 +428,24 @@ impl Scheduler {
         }
     }
 
+    fn find_least_loaded_thread(channels: &Buffers) -> usize {
+        let mut min = usize::MAX;
+        let mut least_loaded_thread = 0;
+        for (i, (sender, _)) in channels.into_iter().enumerate() {
+            if sender.len() < min {
+                min = sender.len();
+                least_loaded_thread = i;
+            }
+        }
+        least_loaded_thread
+    }
+
     fn get_thread_number(
         sch_packet: &SchPacket,
         lookup_table: &mut LookupTable,
-        _buffer_status: &BufferStatus,
         channels: &Buffers,
     ) -> u64 {
-        let mut target_thread = 0;
+        let target_thread;
         for acct in &sch_packet.accts {
             let entry = lookup_table.acct_lookup.get(acct);
             if entry.is_some() {
@@ -432,33 +455,39 @@ impl Scheduler {
 
         // case 1: when no account is found in any thread
         if lookup_table.lookup_results.is_empty() {
-            let mut min = usize::MAX;
-            for (i, (sender, _)) in channels.into_iter().enumerate() {
-                if sender.len() < min {
-                    min = sender.len();
-                    target_thread = i;
-                }
-            }
-            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet, sch_packet.total_cu);
+            target_thread = Self::find_least_loaded_thread(channels);
+            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
             lookup_table.lookup_results.clear();
             return target_thread as u64;
         } else {
-            let result = lookup_table.lookup_results.iter().fold(
-                vec![0; lookup_table.lookup_results[0].len()],
-                |acc, vec| {
-                    acc.iter()
-                        .zip(vec.iter())
-                        .map(|(&a, &b)| a.max(b))
-                        .collect()
-                },
-            );
-            target_thread = result
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, item)| item)
-                .map(|(i, _)| i)
-                .unwrap();
-            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet, sch_packet.total_cu);
+            let mut prev_thread_selection = 0;
+            for (i, entry) in lookup_table.lookup_results.iter().enumerate() {
+                let non_zero_values = entry.iter().filter(|&x| *x != 0);
+                if non_zero_values.count() == 1 {
+                    if i == 0 {
+                        prev_thread_selection = entry.iter().position(|&x| x != 0).unwrap();
+                    } else if i != 0 {
+                        if prev_thread_selection == entry.iter().position(|&x| x != 0).unwrap() {
+                        } else {
+                            target_thread = Self::find_least_loaded_thread(channels);
+                            Self::update_lookup_table(
+                                lookup_table,
+                                target_thread as u64,
+                                sch_packet,
+                            );
+                            lookup_table.lookup_results.clear();
+                            return target_thread as u64;
+                        }
+                    }
+                } else {
+                    target_thread = Self::find_least_loaded_thread(channels);
+                    Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
+                    lookup_table.lookup_results.clear();
+                    return target_thread as u64;
+                }
+            }
+            target_thread = prev_thread_selection;
+            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
             lookup_table.lookup_results.clear();
             return target_thread as u64;
         }
@@ -468,28 +497,24 @@ impl Scheduler {
         lookup_table: &mut LookupTable,
         target_thread: u64,
         sch_packet: &SchPacket,
-        cus: u64,
     ) {
         for acct in &sch_packet.accts {
             let mut new_entry = vec![0; BANKING_THREADS];
-            new_entry[target_thread as usize] = cus;
+            new_entry[target_thread as usize] = 1;
             lookup_table
                 .acct_lookup
                 .entry(*acct)
-                .and_modify(|v| v[target_thread as usize] += cus)
+                .and_modify(|v| v[target_thread as usize] += 1)
                 .or_insert(new_entry);
         }
     }
 
-    fn get_tx_meta_info(
-        packet: &Packet,
-        bank: &Bank,
-    ) -> (SanitizedTransaction, u64, u64, Vec<Pubkey>) {
+    fn get_tx_meta_info(packet: &Packet, bank: &Bank) -> (SanitizedTransaction, u64, Vec<Pubkey>) {
         let sanitized_versioned_transaction = Scheduler::get_sanitized_transaction(packet);
-        let (total_cu, tx) = Scheduler::get_tx_and_txcost(&bank, &sanitized_versioned_transaction);
+        let tx = Scheduler::get_tx(&bank, &sanitized_versioned_transaction);
         let priority = Scheduler::get_priority(&sanitized_versioned_transaction);
         let accts = Scheduler::get_accts(&sanitized_versioned_transaction);
-        (tx, total_cu, priority, accts)
+        (tx, priority, accts)
     }
 
     fn get_priority(sanitized_transaction: &SanitizedVersionedTransaction) -> u64 {
@@ -502,12 +527,10 @@ impl Scheduler {
         }
     }
 
-    fn get_tx_and_txcost(
+    fn get_tx(
         bank: &Bank,
         sanitized_transaction: &SanitizedVersionedTransaction,
-    ) -> (u64, SanitizedTransaction) {
-        let fs = bank.feature_set.as_ref();
-
+    ) -> SanitizedTransaction {
         let tx = SanitizedTransaction::try_new(
             sanitized_transaction.clone(),
             sanitized_transaction.get_message().message.hash(),
@@ -516,13 +539,7 @@ impl Scheduler {
         )
         .unwrap();
 
-        let transaction_cost = CostModel::calculate_cost(&tx, fs);
-        let total_cu = transaction_cost.signature_cost
-            + transaction_cost.write_lock_cost
-            + transaction_cost.data_bytes_cost
-            + transaction_cost.builtins_execution_cost
-            + transaction_cost.bpf_execution_cost;
-        (total_cu, tx)
+        tx
     }
 
     fn get_packet_batches(non_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
@@ -607,7 +624,7 @@ impl BankingStage {
             connection_cache,
             bank_forks,
             prioritization_fee_cache,
-            receivers
+            receivers,
         )
     }
 
@@ -632,7 +649,7 @@ impl BankingStage {
         // This thread talks to poh_service and broadcasts the entries once they have been recorded.
         // Once an entry has been recorded, its blockhash is registered with the bank.
         let data_budget = Arc::new(DataBudget::default());
-        let _receivers = Arc::new(receivers);
+        let receivers = Arc::new(receivers);
         let batch_limit =
             TOTAL_BUFFERED_PACKETS / ((num_threads - NUM_VOTE_PROCESSING_THREADS) as usize);
         // Keeps track of extraneous vote transactions for the vote threads
@@ -641,58 +658,81 @@ impl BankingStage {
         let bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
             .map(|id| {
                 // let x = &receivers;
-                let (packet_receiver, unprocessed_transaction_storage) =
-                    match id {
-                        0 => (
-                            tpu_vote_receiver.clone(),
-                            UnprocessedTransactionStorage::new_transaction_storage(
-                                UnprocessedPacketBatches::with_capacity(batch_limit),
-                                ThreadType::Voting(VoteSource::Tpu),
-                            ),
+                let (packet_receiver, unprocessed_transaction_storage) = match id {
+                    0 => (
+                        receivers.get(0).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Voting(VoteSource::Tpu),
                         ),
-                        _ => (
-                            non_vote_receiver.clone(),
-                            UnprocessedTransactionStorage::new_transaction_storage(
-                                UnprocessedPacketBatches::with_capacity(batch_limit),
-                                ThreadType::Transactions,
-                            ),
+                    ),
+                    1 => (
+                        receivers.get(1).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
                         ),
-                    };
+                    ),
+                    2 => (
+                        receivers.get(2).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
+                    3 => (
+                        receivers.get(3).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
+                    _ => (
+                        receivers.get(0).clone(),
+                        UnprocessedTransactionStorage::new_transaction_storage(
+                            UnprocessedPacketBatches::with_capacity(batch_limit),
+                            ThreadType::Transactions,
+                        ),
+                    ),
+                };
 
-                let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
+                // let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
                 let poh_recorder = poh_recorder.clone();
 
-                let committer = Committer::new(
-                    transaction_status_sender.clone(),
-                    replay_vote_sender.clone(),
-                    prioritization_fee_cache.clone(),
-                );
-                let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
-                let forwarder = Forwarder::new(
-                    poh_recorder.clone(),
-                    bank_forks.clone(),
-                    cluster_info.clone(),
-                    connection_cache.clone(),
-                    data_budget.clone(),
-                );
-                let consumer = Consumer::new(
-                    committer,
-                    poh_recorder.read().unwrap().new_recorder(),
-                    QosService::new(id),
-                    log_messages_bytes_limit,
-                );
+                // let committer = Committer::new(
+                //     transaction_status_sender.clone(),
+                //     replay_vote_sender.clone(),
+                //     prioritization_fee_cache.clone(),
+                // );
+                // let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
+                // let forwarder = Forwarder::new(
+                //     poh_recorder.clone(),
+                //     bank_forks.clone(),
+                //     cluster_info.clone(),
+                //     connection_cache.clone(),
+                //     data_budget.clone(),
+                // );
+                // let consumer = Consumer::new(
+                //     committer,
+                //     poh_recorder.read().unwrap().new_recorder(),
+                //     QosService::new(id),
+                //     log_messages_bytes_limit,
+                // );
 
                 Builder::new()
                     .name(format!("solBanknStgTx{id:02}"))
                     .spawn(move || {
-                        Self::process_loop(
-                            &mut packet_receiver,
-                            &decision_maker,
-                            &forwarder,
-                            &consumer,
-                            id,
-                            unprocessed_transaction_storage,
-                        );
+                        loop {
+                            print!("hello");
+                        }
+                        // Self::process_loop(
+                        //     &mut packet_receiver,
+                        //     &decision_maker,
+                        //     &forwarder,
+                        //     &consumer,
+                        //     id,
+                        //     unprocessed_transaction_storage,
+                        // );
                     })
                     .unwrap()
             })
@@ -1364,143 +1404,143 @@ mod tests {
         tick_producer.unwrap()
     }
 
-//     #[test]
-//     fn test_unprocessed_transaction_storage_full_send() {
-//         solana_logger::setup();
-//         let GenesisConfigInfo {
-//             mut genesis_config,
-//             mint_keypair,
-//             ..
-//         } = create_slow_genesis_config(10000);
-//         activate_feature(
-//             &mut genesis_config,
-//             allow_votes_to_directly_update_vote_state::id(),
-//         );
-//         let bank = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-//         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
-//         let bank = Arc::new(bank_forks.read().unwrap().get(0).unwrap());
-//         let start_hash = bank.last_blockhash();
-//         let banking_tracer = BankingTracer::new_disabled();
-//         let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
-//         let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
-//         let (gossip_vote_sender, gossip_vote_receiver) =
-//             banking_tracer.create_channel_gossip_vote();
-//         let ledger_path = get_tmp_ledger_path_auto_delete!();
-//         {
-//             let blockstore = Arc::new(
-//                 Blockstore::open(ledger_path.path())
-//                     .expect("Expected to be able to open database ledger"),
-//             );
-//             let poh_config = PohConfig {
-//                 // limit tick count to avoid clearing working_bank at PohRecord then
-//                 // PohRecorderError(MaxHeightReached) at BankingStage
-//                 target_tick_count: Some(bank.max_tick_height() - 1),
-//                 ..PohConfig::default()
-//             };
-//             let (exit, poh_recorder, poh_service, _entry_receiver) =
-//                 create_test_recorder(&bank, &blockstore, Some(poh_config), None);
-//             let (_, cluster_info) = new_test_cluster_info(/*keypair:*/ None);
-//             let cluster_info = Arc::new(cluster_info);
-//             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+    //     #[test]
+    //     fn test_unprocessed_transaction_storage_full_send() {
+    //         solana_logger::setup();
+    //         let GenesisConfigInfo {
+    //             mut genesis_config,
+    //             mint_keypair,
+    //             ..
+    //         } = create_slow_genesis_config(10000);
+    //         activate_feature(
+    //             &mut genesis_config,
+    //             allow_votes_to_directly_update_vote_state::id(),
+    //         );
+    //         let bank = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+    //         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+    //         let bank = Arc::new(bank_forks.read().unwrap().get(0).unwrap());
+    //         let start_hash = bank.last_blockhash();
+    //         let banking_tracer = BankingTracer::new_disabled();
+    //         let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
+    //         let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
+    //         let (gossip_vote_sender, gossip_vote_receiver) =
+    //             banking_tracer.create_channel_gossip_vote();
+    //         let ledger_path = get_tmp_ledger_path_auto_delete!();
+    //         {
+    //             let blockstore = Arc::new(
+    //                 Blockstore::open(ledger_path.path())
+    //                     .expect("Expected to be able to open database ledger"),
+    //             );
+    //             let poh_config = PohConfig {
+    //                 // limit tick count to avoid clearing working_bank at PohRecord then
+    //                 // PohRecorderError(MaxHeightReached) at BankingStage
+    //                 target_tick_count: Some(bank.max_tick_height() - 1),
+    //                 ..PohConfig::default()
+    //             };
+    //             let (exit, poh_recorder, poh_service, _entry_receiver) =
+    //                 create_test_recorder(&bank, &blockstore, Some(poh_config), None);
+    //             let (_, cluster_info) = new_test_cluster_info(/*keypair:*/ None);
+    //             let cluster_info = Arc::new(cluster_info);
+    //             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
-//             let banking_stage = BankingStage::new(
-//                 &cluster_info,
-//                 &poh_recorder,
-//                 non_vote_receiver,
-//                 tpu_vote_receiver,
-//                 gossip_vote_receiver,
-//                 None,
-//                 replay_vote_sender,
-//                 None,
-//                 Arc::new(ConnectionCache::default()),
-//                 bank_forks,
-//                 &Arc::new(PrioritizationFeeCache::new(0u64)),
-//             );
+    //             let banking_stage = BankingStage::new(
+    //                 &cluster_info,
+    //                 &poh_recorder,
+    //                 non_vote_receiver,
+    //                 tpu_vote_receiver,
+    //                 gossip_vote_receiver,
+    //                 None,
+    //                 replay_vote_sender,
+    //                 None,
+    //                 Arc::new(ConnectionCache::default()),
+    //                 bank_forks,
+    //                 &Arc::new(PrioritizationFeeCache::new(0u64)),
+    //             );
 
-//             let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
-//             let vote_keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
-//             for keypair in keypairs.iter() {
-//                 bank.process_transaction(&system_transaction::transfer(
-//                     &mint_keypair,
-//                     &keypair.pubkey(),
-//                     20,
-//                     start_hash,
-//                 ))
-//                 .unwrap();
-//             }
+    //             let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
+    //             let vote_keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
+    //             for keypair in keypairs.iter() {
+    //                 bank.process_transaction(&system_transaction::transfer(
+    //                     &mint_keypair,
+    //                     &keypair.pubkey(),
+    //                     20,
+    //                     start_hash,
+    //                 ))
+    //                 .unwrap();
+    //             }
 
-//             // Send a bunch of votes and transfers
-//             let tpu_votes = (0..100_usize)
-//                 .map(|i| {
-//                     new_vote_state_update_transaction(
-//                         VoteStateUpdate::from(vec![
-//                             (0, 8),
-//                             (1, 7),
-//                             (i as u64 + 10, 6),
-//                             (i as u64 + 11, 1),
-//                         ]),
-//                         Hash::new_unique(),
-//                         &keypairs[i],
-//                         &vote_keypairs[i],
-//                         &vote_keypairs[i],
-//                         None,
-//                     );
-//                 })
-//                 .collect_vec();
-//             let gossip_votes = (0..100_usize)
-//                 .map(|i| {
-//                     new_vote_state_update_transaction(
-//                         VoteStateUpdate::from(vec![
-//                             (0, 8),
-//                             (1, 7),
-//                             (i as u64 + 64 + 5, 6),
-//                             (i as u64 + 7, 1),
-//                         ]),
-//                         Hash::new_unique(),
-//                         &keypairs[i],
-//                         &vote_keypairs[i],
-//                         &vote_keypairs[i],
-//                         None,
-//                     );
-//                 })
-//                 .collect_vec();
-//             let txs = (0..100_usize)
-//                 .map(|i| {
-//                     system_transaction::transfer(
-//                         &keypairs[i],
-//                         &keypairs[(i + 1) % 100].pubkey(),
-//                         10,
-//                         start_hash,
-//                     );
-//                 })
-//                 .collect_vec();
+    //             // Send a bunch of votes and transfers
+    //             let tpu_votes = (0..100_usize)
+    //                 .map(|i| {
+    //                     new_vote_state_update_transaction(
+    //                         VoteStateUpdate::from(vec![
+    //                             (0, 8),
+    //                             (1, 7),
+    //                             (i as u64 + 10, 6),
+    //                             (i as u64 + 11, 1),
+    //                         ]),
+    //                         Hash::new_unique(),
+    //                         &keypairs[i],
+    //                         &vote_keypairs[i],
+    //                         &vote_keypairs[i],
+    //                         None,
+    //                     );
+    //                 })
+    //                 .collect_vec();
+    //             let gossip_votes = (0..100_usize)
+    //                 .map(|i| {
+    //                     new_vote_state_update_transaction(
+    //                         VoteStateUpdate::from(vec![
+    //                             (0, 8),
+    //                             (1, 7),
+    //                             (i as u64 + 64 + 5, 6),
+    //                             (i as u64 + 7, 1),
+    //                         ]),
+    //                         Hash::new_unique(),
+    //                         &keypairs[i],
+    //                         &vote_keypairs[i],
+    //                         &vote_keypairs[i],
+    //                         None,
+    //                     );
+    //                 })
+    //                 .collect_vec();
+    //             let txs = (0..100_usize)
+    //                 .map(|i| {
+    //                     system_transaction::transfer(
+    //                         &keypairs[i],
+    //                         &keypairs[(i + 1) % 100].pubkey(),
+    //                         10,
+    //                         start_hash,
+    //                     );
+    //                 })
+    //                 .collect_vec();
 
-//             let non_vote_packet_batches = to_packet_batches(&txs, 10);
-//             let tpu_packet_batches = to_packet_batches(&tpu_votes, 10);
-//             let gossip_packet_batches = to_packet_batches(&gossip_votes, 10);
+    //             let non_vote_packet_batches = to_packet_batches(&txs, 10);
+    //             let tpu_packet_batches = to_packet_batches(&tpu_votes, 10);
+    //             let gossip_packet_batches = to_packet_batches(&gossip_votes, 10);
 
-//             // Send em all
-//             [
-//                 (non_vote_packet_batches, non_vote_sender),
-//                 (tpu_packet_batches, tpu_vote_sender),
-//                 (gossip_packet_batches, gossip_vote_sender),
-//             ]
-//             .into_iter()
-//             .map(|(packet_batches, sender)| {
-//                 Builder::new()
-//                     .spawn(move || {
-//                         sender
-//                             .send(BankingPacketBatch::new((packet_batches, None)))
-//                             .unwrap()
-//                     })
-//                     .unwrap()
-//             })
-//             .for_each(|handle| handle.join().unwrap());
+    //             // Send em all
+    //             [
+    //                 (non_vote_packet_batches, non_vote_sender),
+    //                 (tpu_packet_batches, tpu_vote_sender),
+    //                 (gossip_packet_batches, gossip_vote_sender),
+    //             ]
+    //             .into_iter()
+    //             .map(|(packet_batches, sender)| {
+    //                 Builder::new()
+    //                     .spawn(move || {
+    //                         sender
+    //                             .send(BankingPacketBatch::new((packet_batches, None)))
+    //                             .unwrap()
+    //                     })
+    //                     .unwrap()
+    //             })
+    //             .for_each(|handle| handle.join().unwrap());
 
-//             banking_stage.join().unwrap();
-//             exit.store(true, Ordering::Relaxed);
-//             poh_service.join().unwrap();
-//         }
-//         Blockstore::destroy(ledger_path.path()).unwrap();
-//     }
+    //             banking_stage.join().unwrap();
+    //             exit.store(true, Ordering::Relaxed);
+    //             poh_service.join().unwrap();
+    //         }
+    //         Blockstore::destroy(ledger_path.path()).unwrap();
+    //     }
 }

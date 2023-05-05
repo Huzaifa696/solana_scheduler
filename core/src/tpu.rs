@@ -1,8 +1,6 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
-use std::sync::atomic::AtomicU64;
-
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
 
 // use crate::banking_stage;
@@ -62,25 +60,6 @@ pub struct TpuSockets {
 }
 
 pub const BANKING_THREADS: usize = 4;
-
-pub struct BufferStatus {
-    pub pushed_cus: Vec<AtomicU64>,
-    pub consumed_cus: Vec<AtomicU64>,
-    pub thread_load_est: Vec<AtomicU64>,
-}
-
-impl BufferStatus {
-    fn new(capacity: usize) -> Self {
-        let pushed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
-        let consumed_cus: Vec<AtomicU64> = Vec::with_capacity(capacity);
-        let thread_load_est: Vec<AtomicU64> = Vec::with_capacity(capacity);
-        BufferStatus {
-            pushed_cus,
-            consumed_cus,
-            thread_load_est,
-        }
-    }
-}
 
 pub struct Tpu {
     fetch_stage: FetchStage,
@@ -264,11 +243,11 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        // atomics for keeping track of buffer status
-        let buffer_status = Arc::new(BufferStatus::new(BANKING_THREADS));
-        let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> =
-            vec![(); BANKING_THREADS].into_iter().map(|_| bounded(32)).collect();
-        let scheduler = Scheduler::new(&non_vote_receiver, poh_recorder, &buffer_status, &channels);
+        let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> = vec![(); BANKING_THREADS]
+            .into_iter()
+            .map(|_| bounded(32))
+            .collect();
+        let scheduler = Scheduler::new(&non_vote_receiver, &tpu_vote_receiver, poh_recorder, &channels);
 
         let receivers: Vec<Receiver<SchPacket>> = channels.into_iter().map(|(_, r)| r).collect();
         let banking_stage = BankingStage::new(
