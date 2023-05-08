@@ -36,6 +36,9 @@ use {
     },
 };
 
+use crate::banking_stage::SchPacket;
+use crossbeam_channel::Receiver;
+
 pub const MAX_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
 
 pub struct ProcessTransactionBatchOutput {
@@ -90,36 +93,22 @@ impl Consumer {
     pub fn consume_buffered_packets(
         &self,
         bank_start: &BankStart,
-        unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
+        packet_receiver: &Receiver<SchPacket>,
         banking_stage_stats: &BankingStageStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) {
         let mut rebuffered_packet_count = 0;
         let mut consumed_buffered_packets_count = 0;
         let mut proc_start = Measure::start("consume_buffered_process");
-        let num_packets_to_process = unprocessed_transaction_storage.len();
+        let num_packets_to_process = packet_receiver.len();
 
-        let reached_end_of_slot = unprocessed_transaction_storage.process_packets(
-            bank_start.working_bank.clone(),
+        self.do_process_packets(
+            packet_receiver,
+            bank_start,
             banking_stage_stats,
-            slot_metrics_tracker,
-            |packets_to_process, payload| {
-                self.do_process_packets(
-                    bank_start,
-                    payload,
-                    banking_stage_stats,
-                    &mut consumed_buffered_packets_count,
-                    &mut rebuffered_packet_count,
-                    packets_to_process,
-                )
-            },
+            &mut consumed_buffered_packets_count,
+            &mut rebuffered_packet_count
         );
-
-        if reached_end_of_slot {
-            slot_metrics_tracker.set_end_of_slot_unprocessed_buffer_len(
-                unprocessed_transaction_storage.len() as u64,
-            );
-        }
 
         proc_start.stop();
         debug!(
@@ -144,43 +133,46 @@ impl Consumer {
 
     fn do_process_packets(
         &self,
+        packet_receiver: &Receiver<SchPacket>,
         bank_start: &BankStart,
-        payload: &mut ConsumeScannerPayload,
         banking_stage_stats: &BankingStageStats,
         consumed_buffered_packets_count: &mut usize,
         rebuffered_packet_count: &mut usize,
-        packets_to_process: &Vec<Arc<ImmutableDeserializedPacket>>,
-    ) -> Option<Vec<usize>> {
-        if payload.reached_end_of_slot {
-            return None;
-        }
+    ) 
+    // -> Option<Vec<usize>> 
+    {
+        // if payload.reached_end_of_slot {
+        //     return None;
+        // }
 
-        let packets_to_process_len = packets_to_process.len();
+        // let packets_to_process_len = packet_receiver.len();
+
+        let sch_packet = &packet_receiver.try_recv().unwrap();
+        let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self
             .process_packets_transactions(
                 &bank_start.working_bank,
                 &bank_start.bank_creation_time,
-                &payload.sanitized_transactions,
+                &uni_tx_array,
                 banking_stage_stats,
-                payload.slot_metrics_tracker,
+                // slot_metrics_tracker,
             ));
-        payload
-            .slot_metrics_tracker
-            .increment_process_packets_transactions_us(process_packets_transactions_us);
+        // slot_metrics_tracker
+        //     .increment_process_packets_transactions_us(process_packets_transactions_us);
 
         // Clear payload for next iteration
-        payload.sanitized_transactions.clear();
-        payload.account_locks.clear();
+        // payload.sanitized_transactions.clear();
+        // payload.account_locks.clear();
 
-        let ProcessTransactionsSummary {
-            reached_max_poh_height,
-            retryable_transaction_indexes,
-            ..
-        } = process_transactions_summary;
+        // let ProcessTransactionsSummary {
+        //     reached_max_poh_height,
+        //     retryable_transaction_indexes,
+        //     ..
+        // } = process_transactions_summary;
 
-        if reached_max_poh_height || !bank_start.should_working_bank_still_be_processing_txs() {
-            payload.reached_end_of_slot = true;
-        }
+        // if reached_max_poh_height || !bank_start.should_working_bank_still_be_processing_txs() {
+        //     payload.reached_end_of_slot = true;
+        // }
 
         // The difference between all transactions passed to execution and the ones that
         // are retryable were the ones that were either:
@@ -189,18 +181,18 @@ impl Consumer {
         // duplicate signature, etc.)
         //
         // Note: This assumes that every packet deserializes into one transaction!
-        *consumed_buffered_packets_count +=
-            packets_to_process_len.saturating_sub(retryable_transaction_indexes.len());
+        // *consumed_buffered_packets_count +=
+        //     packets_to_process_len.saturating_sub(retryable_transaction_indexes.len());
 
         // Out of the buffered packets just retried, collect any still unprocessed
         // transactions in this batch for forwarding
-        *rebuffered_packet_count += retryable_transaction_indexes.len();
+        // *rebuffered_packet_count += retryable_transaction_indexes.len();
 
-        payload
-            .slot_metrics_tracker
-            .increment_retryable_packets_count(retryable_transaction_indexes.len() as u64);
+        // payload
+        //     .slot_metrics_tracker
+        //     .increment_retryable_packets_count(retryable_transaction_indexes.len() as u64);
 
-        Some(retryable_transaction_indexes)
+        // Some(retryable_transaction_indexes)
     }
 
     fn process_packets_transactions(
@@ -209,54 +201,56 @@ impl Consumer {
         bank_creation_time: &Instant,
         sanitized_transactions: &[SanitizedTransaction],
         banking_stage_stats: &BankingStageStats,
-        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-    ) -> ProcessTransactionsSummary {
+        // slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+    ) 
+    // -> ProcessTransactionsSummary 
+    {
         let (mut process_transactions_summary, process_transactions_us) = measure_us!(
             self.process_transactions(bank, bank_creation_time, sanitized_transactions)
         );
-        slot_metrics_tracker.increment_process_transactions_us(process_transactions_us);
-        banking_stage_stats
-            .transaction_processing_elapsed
-            .fetch_add(process_transactions_us, Ordering::Relaxed);
+        // slot_metrics_tracker.increment_process_transactions_us(process_transactions_us);
+        // banking_stage_stats
+        //     .transaction_processing_elapsed
+        //     .fetch_add(process_transactions_us, Ordering::Relaxed);
 
-        let ProcessTransactionsSummary {
-            ref retryable_transaction_indexes,
-            ref error_counters,
-            ..
-        } = process_transactions_summary;
+        // let ProcessTransactionsSummary {
+        //     ref retryable_transaction_indexes,
+        //     ref error_counters,
+        //     ..
+        // } = process_transactions_summary;
 
-        slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
-        slot_metrics_tracker.accumulate_transaction_errors(error_counters);
+        // slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
+        // slot_metrics_tracker.accumulate_transaction_errors(error_counters);
 
-        let retryable_tx_count = retryable_transaction_indexes.len();
-        inc_new_counter_info!("banking_stage-unprocessed_transactions", retryable_tx_count);
+        // let retryable_tx_count = retryable_transaction_indexes.len();
+        // inc_new_counter_info!("banking_stage-unprocessed_transactions", retryable_tx_count);
 
         // Filter out the retryable transactions that are too old
-        let (filtered_retryable_transaction_indexes, filter_retryable_packets_us) =
-            measure_us!(Self::filter_pending_packets_from_pending_txs(
-                bank,
-                sanitized_transactions,
-                retryable_transaction_indexes,
-            ));
-        slot_metrics_tracker.increment_filter_retryable_packets_us(filter_retryable_packets_us);
-        banking_stage_stats
-            .filter_pending_packets_elapsed
-            .fetch_add(filter_retryable_packets_us, Ordering::Relaxed);
+        // let (filtered_retryable_transaction_indexes, filter_retryable_packets_us) =
+        //     measure_us!(Self::filter_pending_packets_from_pending_txs(
+        //         bank,
+        //         sanitized_transactions,
+        //         retryable_transaction_indexes,
+        //     ));
+        // slot_metrics_tracker.increment_filter_retryable_packets_us(filter_retryable_packets_us);
+        // banking_stage_stats
+        //     .filter_pending_packets_elapsed
+        //     .fetch_add(filter_retryable_packets_us, Ordering::Relaxed);
 
-        let retryable_packets_filtered_count = retryable_transaction_indexes
-            .len()
-            .saturating_sub(filtered_retryable_transaction_indexes.len());
-        slot_metrics_tracker
-            .increment_retryable_packets_filtered_count(retryable_packets_filtered_count as u64);
+        // let retryable_packets_filtered_count = retryable_transaction_indexes
+        //     .len()
+        //     .saturating_sub(filtered_retryable_transaction_indexes.len());
+        // slot_metrics_tracker
+        //     .increment_retryable_packets_filtered_count(retryable_packets_filtered_count as u64);
 
-        inc_new_counter_info!(
-            "banking_stage-dropped_tx_before_forwarding",
-            retryable_packets_filtered_count
-        );
+        // inc_new_counter_info!(
+        //     "banking_stage-dropped_tx_before_forwarding",
+        //     retryable_packets_filtered_count
+        // );
 
-        process_transactions_summary.retryable_transaction_indexes =
-            filtered_retryable_transaction_indexes;
-        process_transactions_summary
+        // process_transactions_summary.retryable_transaction_indexes =
+        //     filtered_retryable_transaction_indexes;
+        // process_transactions_summary
     }
 
     /// Sends transactions to the bank.
@@ -268,24 +262,26 @@ impl Consumer {
         bank: &Arc<Bank>,
         bank_creation_time: &Instant,
         transactions: &[SanitizedTransaction],
-    ) -> ProcessTransactionsSummary {
+    ) 
+    // -> ProcessTransactionsSummary 
+    {
         let mut chunk_start = 0;
-        let mut all_retryable_tx_indexes = vec![];
-        // All the transactions that attempted execution. See description of
-        // struct ProcessTransactionsSummary above for possible outcomes.
-        let mut total_transactions_attempted_execution_count: usize = 0;
-        // All transactions that were executed and committed
-        let mut total_committed_transactions_count: usize = 0;
-        // All transactions that were executed and committed with a successful result
-        let mut total_committed_transactions_with_successful_result_count: usize = 0;
-        // All transactions that were executed but then failed record because the
-        // slot ended
-        let mut total_failed_commit_count: usize = 0;
-        let mut total_cost_model_throttled_transactions_count: usize = 0;
-        let mut total_cost_model_us: u64 = 0;
-        let mut total_execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
-        let mut total_error_counters = TransactionErrorMetrics::default();
-        let mut reached_max_poh_height = false;
+        // let mut all_retryable_tx_indexes = vec![];
+        // // All the transactions that attempted execution. See description of
+        // // struct ProcessTransactionsSummary above for possible outcomes.
+        // let mut total_transactions_attempted_execution_count: usize = 0;
+        // // All transactions that were executed and committed
+        // let mut total_committed_transactions_count: usize = 0;
+        // // All transactions that were executed and committed with a successful result
+        // let mut total_committed_transactions_with_successful_result_count: usize = 0;
+        // // All transactions that were executed but then failed record because the
+        // // slot ended
+        // let mut total_failed_commit_count: usize = 0;
+        // let mut total_cost_model_throttled_transactions_count: usize = 0;
+        // let mut total_cost_model_us: u64 = 0;
+        // let mut total_execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
+        // let mut total_error_counters = TransactionErrorMetrics::default();
+        // let mut reached_max_poh_height = false;
         while chunk_start != transactions.len() {
             let chunk_end = std::cmp::min(
                 transactions.len(),
@@ -297,95 +293,95 @@ impl Consumer {
                 chunk_start,
             );
 
-            let ProcessTransactionBatchOutput {
-                cost_model_throttled_transactions_count: new_cost_model_throttled_transactions_count,
-                cost_model_us: new_cost_model_us,
-                execute_and_commit_transactions_output,
-            } = process_transaction_batch_output;
-            saturating_add_assign!(
-                total_cost_model_throttled_transactions_count,
-                new_cost_model_throttled_transactions_count
-            );
-            saturating_add_assign!(total_cost_model_us, new_cost_model_us);
+            // let ProcessTransactionBatchOutput {
+            //     cost_model_throttled_transactions_count: new_cost_model_throttled_transactions_count,
+            //     cost_model_us: new_cost_model_us,
+            //     execute_and_commit_transactions_output,
+            // } = process_transaction_batch_output;
+            // saturating_add_assign!(
+            //     total_cost_model_throttled_transactions_count,
+            //     new_cost_model_throttled_transactions_count
+            // );
+            // saturating_add_assign!(total_cost_model_us, new_cost_model_us);
 
-            let ExecuteAndCommitTransactionsOutput {
-                transactions_attempted_execution_count: new_transactions_attempted_execution_count,
-                executed_transactions_count: new_executed_transactions_count,
-                executed_with_successful_result_count: new_executed_with_successful_result_count,
-                retryable_transaction_indexes: new_retryable_transaction_indexes,
-                commit_transactions_result: new_commit_transactions_result,
-                execute_and_commit_timings: new_execute_and_commit_timings,
-                error_counters: new_error_counters,
-                ..
-            } = execute_and_commit_transactions_output;
+            // let ExecuteAndCommitTransactionsOutput {
+            //     transactions_attempted_execution_count: new_transactions_attempted_execution_count,
+            //     executed_transactions_count: new_executed_transactions_count,
+            //     executed_with_successful_result_count: new_executed_with_successful_result_count,
+            //     retryable_transaction_indexes: new_retryable_transaction_indexes,
+            //     commit_transactions_result: new_commit_transactions_result,
+            //     execute_and_commit_timings: new_execute_and_commit_timings,
+            //     error_counters: new_error_counters,
+            //     ..
+            // } = execute_and_commit_transactions_output;
 
-            total_execute_and_commit_timings.accumulate(&new_execute_and_commit_timings);
-            total_error_counters.accumulate(&new_error_counters);
-            saturating_add_assign!(
-                total_transactions_attempted_execution_count,
-                new_transactions_attempted_execution_count
-            );
+            // total_execute_and_commit_timings.accumulate(&new_execute_and_commit_timings);
+            // total_error_counters.accumulate(&new_error_counters);
+            // saturating_add_assign!(
+            //     total_transactions_attempted_execution_count,
+            //     new_transactions_attempted_execution_count
+            // );
 
-            trace!(
-                "process_transactions result: {:?}",
-                new_commit_transactions_result
-            );
+            // trace!(
+            //     "process_transactions result: {:?}",
+            //     new_commit_transactions_result
+            // );
 
-            if new_commit_transactions_result.is_ok() {
-                saturating_add_assign!(
-                    total_committed_transactions_count,
-                    new_executed_transactions_count
-                );
-                saturating_add_assign!(
-                    total_committed_transactions_with_successful_result_count,
-                    new_executed_with_successful_result_count
-                );
-            } else {
-                saturating_add_assign!(total_failed_commit_count, new_executed_transactions_count);
-            }
+            // if new_commit_transactions_result.is_ok() {
+            //     saturating_add_assign!(
+            //         total_committed_transactions_count,
+            //         new_executed_transactions_count
+            //     );
+            //     saturating_add_assign!(
+            //         total_committed_transactions_with_successful_result_count,
+            //         new_executed_with_successful_result_count
+            //     );
+            // } else {
+            //     saturating_add_assign!(total_failed_commit_count, new_executed_transactions_count);
+            // }
 
             // Add the retryable txs (transactions that errored in a way that warrants a retry)
             // to the list of unprocessed txs.
-            all_retryable_tx_indexes.extend_from_slice(&new_retryable_transaction_indexes);
+            // all_retryable_tx_indexes.extend_from_slice(&new_retryable_transaction_indexes);
 
-            let should_bank_still_be_processing_txs =
-                Bank::should_bank_still_be_processing_txs(bank_creation_time, bank.ns_per_slot);
-            match (
-                new_commit_transactions_result,
-                should_bank_still_be_processing_txs,
-            ) {
-                (Err(PohRecorderError::MaxHeightReached), _) | (_, false) => {
-                    info!(
-                        "process transactions: max height reached slot: {} height: {}",
-                        bank.slot(),
-                        bank.tick_height()
-                    );
-                    // process_and_record_transactions has returned all retryable errors in
-                    // transactions[chunk_start..chunk_end], so we just need to push the remaining
-                    // transactions into the unprocessed queue.
-                    all_retryable_tx_indexes.extend(chunk_end..transactions.len());
-                    reached_max_poh_height = true;
-                    break;
-                }
-                _ => (),
-            }
-            // Don't exit early on any other type of error, continue processing...
-            chunk_start = chunk_end;
+            // let should_bank_still_be_processing_txs =
+            //     Bank::should_bank_still_be_processing_txs(bank_creation_time, bank.ns_per_slot);
+            // match (
+            //     new_commit_transactions_result,
+            //     should_bank_still_be_processing_txs,
+            // ) {
+            //     (Err(PohRecorderError::MaxHeightReached), _) | (_, false) => {
+            //         info!(
+            //             "process transactions: max height reached slot: {} height: {}",
+            //             bank.slot(),
+            //             bank.tick_height()
+            //         );
+            //         // process_and_record_transactions has returned all retryable errors in
+            //         // transactions[chunk_start..chunk_end], so we just need to push the remaining
+            //         // transactions into the unprocessed queue.
+            //         all_retryable_tx_indexes.extend(chunk_end..transactions.len());
+            //         reached_max_poh_height = true;
+            //         break;
+            //     }
+            //     _ => (),
+            // }
+            // // Don't exit early on any other type of error, continue processing...
+            // chunk_start = chunk_end;
         }
 
-        ProcessTransactionsSummary {
-            reached_max_poh_height,
-            transactions_attempted_execution_count: total_transactions_attempted_execution_count,
-            committed_transactions_count: total_committed_transactions_count,
-            committed_transactions_with_successful_result_count:
-                total_committed_transactions_with_successful_result_count,
-            failed_commit_count: total_failed_commit_count,
-            retryable_transaction_indexes: all_retryable_tx_indexes,
-            cost_model_throttled_transactions_count: total_cost_model_throttled_transactions_count,
-            cost_model_us: total_cost_model_us,
-            execute_and_commit_timings: total_execute_and_commit_timings,
-            error_counters: total_error_counters,
-        }
+        // ProcessTransactionsSummary {
+        //     reached_max_poh_height,
+        //     transactions_attempted_execution_count: total_transactions_attempted_execution_count,
+        //     committed_transactions_count: total_committed_transactions_count,
+        //     committed_transactions_with_successful_result_count:
+        //         total_committed_transactions_with_successful_result_count,
+        //     failed_commit_count: total_failed_commit_count,
+        //     retryable_transaction_indexes: all_retryable_tx_indexes,
+        //     cost_model_throttled_transactions_count: total_cost_model_throttled_transactions_count,
+        //     cost_model_us: total_cost_model_us,
+        //     execute_and_commit_timings: total_execute_and_commit_timings,
+        //     error_counters: total_error_counters,
+        // }
     }
 
     pub fn process_and_record_transactions(

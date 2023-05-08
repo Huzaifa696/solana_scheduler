@@ -335,6 +335,7 @@ impl Scheduler {
         channels: &Buffers,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
+        let vote_packet_receiver = tpu_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
         let channels = channels.clone();
 
@@ -350,7 +351,9 @@ impl Scheduler {
                 let mut target_thread;
                 loop {
                     // packet batches from sigverify stage
-                    let packet_batches = Scheduler::get_packet_batches(&packet_receiver);
+                    let mut packet_batches = Scheduler::get_packet_batches(&packet_receiver);
+                    let vote_packet_batches = Scheduler::get_packet_batches(&vote_packet_receiver);
+                    packet_batches.extend(vote_packet_batches);
 
                     // check if this validator is the current leader
                     let working_bank = Scheduler::get_working_bank(&poh_recorder);
@@ -649,62 +652,30 @@ impl BankingStage {
         // This thread talks to poh_service and broadcasts the entries once they have been recorded.
         // Once an entry has been recorded, its blockhash is registered with the bank.
         let data_budget = Arc::new(DataBudget::default());
-        let receivers = Arc::new(receivers);
-        let batch_limit =
-            TOTAL_BUFFERED_PACKETS / ((num_threads - NUM_VOTE_PROCESSING_THREADS) as usize);
+        // let receivers = Arc::new(receivers.clone());
+        // let batch_limit =
+        // TOTAL_BUFFERED_PACKETS / ((num_threads - NUM_VOTE_PROCESSING_THREADS) as usize);
         // Keeps track of extraneous vote transactions for the vote threads
         let _latest_unprocessed_votes = Arc::new(LatestUnprocessedVotes::new());
         // Many banks that process transactions in parallel.
         let bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
             .map(|id| {
                 // let x = &receivers;
-                let (packet_receiver, unprocessed_transaction_storage) = match id {
-                    0 => (
-                        receivers.get(0).clone(),
-                        UnprocessedTransactionStorage::new_transaction_storage(
-                            UnprocessedPacketBatches::with_capacity(batch_limit),
-                            ThreadType::Voting(VoteSource::Tpu),
-                        ),
-                    ),
-                    1 => (
-                        receivers.get(1).clone(),
-                        UnprocessedTransactionStorage::new_transaction_storage(
-                            UnprocessedPacketBatches::with_capacity(batch_limit),
-                            ThreadType::Transactions,
-                        ),
-                    ),
-                    2 => (
-                        receivers.get(2).clone(),
-                        UnprocessedTransactionStorage::new_transaction_storage(
-                            UnprocessedPacketBatches::with_capacity(batch_limit),
-                            ThreadType::Transactions,
-                        ),
-                    ),
-                    3 => (
-                        receivers.get(3).clone(),
-                        UnprocessedTransactionStorage::new_transaction_storage(
-                            UnprocessedPacketBatches::with_capacity(batch_limit),
-                            ThreadType::Transactions,
-                        ),
-                    ),
-                    _ => (
-                        receivers.get(0).clone(),
-                        UnprocessedTransactionStorage::new_transaction_storage(
-                            UnprocessedPacketBatches::with_capacity(batch_limit),
-                            ThreadType::Transactions,
-                        ),
-                    ),
+                let packet_receiver = match id {
+                    0 => receivers.get(0).unwrap().clone(),
+                    1 => receivers.get(1).unwrap().clone(),
+                    2 => receivers.get(2).unwrap().clone(),
+                    _ => receivers.get(3).unwrap().clone(),
                 };
 
-                // let mut packet_receiver = PacketReceiver::new(id, packet_receiver);
                 let poh_recorder = poh_recorder.clone();
 
-                // let committer = Committer::new(
-                //     transaction_status_sender.clone(),
-                //     replay_vote_sender.clone(),
-                //     prioritization_fee_cache.clone(),
-                // );
-                // let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
+                let committer = Committer::new(
+                    transaction_status_sender.clone(),
+                    replay_vote_sender.clone(),
+                    prioritization_fee_cache.clone(),
+                );
+                let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
                 // let forwarder = Forwarder::new(
                 //     poh_recorder.clone(),
                 //     bank_forks.clone(),
@@ -712,27 +683,44 @@ impl BankingStage {
                 //     connection_cache.clone(),
                 //     data_budget.clone(),
                 // );
-                // let consumer = Consumer::new(
-                //     committer,
-                //     poh_recorder.read().unwrap().new_recorder(),
-                //     QosService::new(id),
-                //     log_messages_bytes_limit,
-                // );
+                let consumer = Consumer::new(
+                    committer,
+                    poh_recorder.read().unwrap().new_recorder(),
+                    QosService::new(id),
+                    log_messages_bytes_limit,
+                );
 
                 Builder::new()
                     .name(format!("solBanknStgTx{id:02}"))
                     .spawn(move || {
+                        // let mut packet_receiver = &packet_receiver;
+                        let mut banking_stage_stats = BankingStageStats::new(id);
+
+                        let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
+                        let mut last_metrics_update = Instant::now();
+
                         loop {
-                            print!("hello");
+                            if packet_receiver.is_empty()
+                                || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
+                            {
+                                let (_, process_buffered_packets_time) = measure!(
+                                    Self::process_buffered_packets(
+                                        &packet_receiver,
+                                        &banking_stage_stats,
+                                        &mut slot_metrics_tracker,
+                                        &consumer,
+                                        &decision_maker,
+                                    ),
+                                    "process_buffered_packets",
+                                );
+                                slot_metrics_tracker.increment_process_buffered_packets_us(
+                                    process_buffered_packets_time.as_us(),
+                                );
+                                last_metrics_update = Instant::now();
+                            }
+
+                            banking_stage_stats.report(1000);
                         }
-                        // Self::process_loop(
-                        //     &mut packet_receiver,
-                        //     &decision_maker,
-                        //     &forwarder,
-                        //     &consumer,
-                        //     id,
-                        //     unprocessed_transaction_storage,
-                        // );
                     })
                     .unwrap()
             })
@@ -742,17 +730,13 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     fn process_buffered_packets(
-        decision_maker: &DecisionMaker,
-        forwarder: &Forwarder,
-        consumer: &Consumer,
-        unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
+        packet_receiver: &Receiver<SchPacket>,
         banking_stage_stats: &BankingStageStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-        tracer_packet_stats: &mut TracerPacketStats,
+        consumer: &Consumer,
+        decision_maker: &DecisionMaker,
     ) {
-        if unprocessed_transaction_storage.should_not_process() {
-            return;
-        }
+
         let (decision, make_decision_time) =
             measure!(decision_maker.make_consume_or_forward_decision());
         let metrics_action = slot_metrics_tracker.check_leader_slot_boundary(decision.bank_start());
@@ -768,7 +752,7 @@ impl BankingStage {
                 let (_, consume_buffered_packets_time) = measure!(
                     consumer.consume_buffered_packets(
                         &bank_start,
-                        unprocessed_transaction_storage,
+                        packet_receiver,
                         banking_stage_stats,
                         slot_metrics_tracker,
                     ),
@@ -777,84 +761,49 @@ impl BankingStage {
                 slot_metrics_tracker
                     .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
             }
-            BufferedPacketsDecision::Forward => {
-                let ((), forward_us) = measure_us!(forwarder.handle_forwarding(
-                    unprocessed_transaction_storage,
-                    false,
-                    slot_metrics_tracker,
-                    banking_stage_stats,
-                    tracer_packet_stats,
-                ));
-                slot_metrics_tracker.increment_forward_us(forward_us);
-                // Take metrics action after forwarding packets to include forwarded
-                // metrics into current slot
-                slot_metrics_tracker.apply_action(metrics_action);
-            }
-            BufferedPacketsDecision::ForwardAndHold => {
-                let ((), forward_and_hold_us) = measure_us!(forwarder.handle_forwarding(
-                    unprocessed_transaction_storage,
-                    true,
-                    slot_metrics_tracker,
-                    banking_stage_stats,
-                    tracer_packet_stats,
-                ));
-                slot_metrics_tracker.increment_forward_and_hold_us(forward_and_hold_us);
-                // Take metrics action after forwarding packets
-                slot_metrics_tracker.apply_action(metrics_action);
-            }
             _ => (),
         }
     }
 
-    fn process_loop(
-        packet_receiver: &mut PacketReceiver,
-        decision_maker: &DecisionMaker,
-        forwarder: &Forwarder,
-        consumer: &Consumer,
-        id: u32,
-        mut unprocessed_transaction_storage: UnprocessedTransactionStorage,
-    ) {
-        let mut banking_stage_stats = BankingStageStats::new(id);
-        let mut tracer_packet_stats = TracerPacketStats::new(id);
+    // fn process_loop(id: u32, packet_receiver: Receiver<SchPacket>) {
+    // let mut banking_stage_stats = BankingStageStats::new(id);
+    // let mut tracer_packet_stats = TracerPacketStats::new(id);
 
-        let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
-        let mut last_metrics_update = Instant::now();
+    // let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
+    // let mut last_metrics_update = Instant::now();
 
-        loop {
-            if !unprocessed_transaction_storage.is_empty()
-                || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
-            {
-                let (_, process_buffered_packets_time) = measure!(
-                    Self::process_buffered_packets(
-                        decision_maker,
-                        forwarder,
-                        consumer,
-                        &mut unprocessed_transaction_storage,
-                        &banking_stage_stats,
-                        &mut slot_metrics_tracker,
-                        &mut tracer_packet_stats,
-                    ),
-                    "process_buffered_packets",
-                );
-                slot_metrics_tracker
-                    .increment_process_buffered_packets_us(process_buffered_packets_time.as_us());
-                last_metrics_update = Instant::now();
-            }
+    // loop {
+    //     if packet_receiver.is_empty()
+    //         || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
+    //     {
+    //         let (_, process_buffered_packets_time) = measure!(
+    //             Self::process_buffered_packets(
+    //                 packet_receiver,
+    //                 &banking_stage_stats,
+    //                 &mut slot_metrics_tracker,
+    //                 &mut tracer_packet_stats,
+    //             ),
+    //             "process_buffered_packets",
+    //         );
+    //         slot_metrics_tracker
+    //             .increment_process_buffered_packets_us(process_buffered_packets_time.as_us());
+    //         last_metrics_update = Instant::now();
+    //     }
 
-            tracer_packet_stats.report(1000);
+    //     tracer_packet_stats.report(1000);
 
-            match packet_receiver.receive_and_buffer_packets(
-                &mut unprocessed_transaction_storage,
-                &mut banking_stage_stats,
-                &mut tracer_packet_stats,
-                &mut slot_metrics_tracker,
-            ) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-            banking_stage_stats.report(1000);
-        }
-    }
+    //     // match packet_receiver.receive_and_buffer_packets(
+    //     //     &mut unprocessed_transaction_storage,
+    //     //     &mut banking_stage_stats,
+    //     //     &mut tracer_packet_stats,
+    //     //     &mut slot_metrics_tracker,
+    //     // ) {
+    //     //     Ok(()) | Err(RecvTimeoutError::Timeout) => (),
+    //     //     Err(RecvTimeoutError::Disconnected) => break,
+    //     // }
+    //     banking_stage_stats.report(1000);
+    // }
+    // }
 
     pub fn num_threads() -> u32 {
         cmp::max(
