@@ -1,6 +1,8 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
+use crate::tpu::ControlObj;
+use crossbeam_channel::Sender;
 use std::collections::HashMap;
 // use std::hash::Hash;
 use crossbeam_channel::Receiver;
@@ -12,6 +14,7 @@ use solana_poh::poh_recorder::BankStart;
 use solana_runtime::bank::Bank;
 // use solana_runtime::cost_model::TransactionCost;
 use solana_runtime::transaction_priority_details::GetTransactionPriorityDetails;
+use solana_sdk::program_pack::Pack;
 use solana_sdk::transaction::SanitizedTransaction;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -25,18 +28,18 @@ use {
     self::{
         consumer::Consumer,
         decision_maker::{BufferedPacketsDecision, DecisionMaker},
-        forwarder::Forwarder,
-        packet_receiver::PacketReceiver,
+        // forwarder::Forwarder,
+        // packet_receiver::PacketReceiver,
     },
     crate::{
         banking_stage::committer::Committer,
         banking_trace::BankingPacketReceiver,
-        latest_unprocessed_votes::{LatestUnprocessedVotes, VoteSource},
+        // latest_unprocessed_votes::{LatestUnprocessedVotes, VoteSource},
         leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         qos_service::QosService,
         tracer_packet_stats::TracerPacketStats,
         unprocessed_packet_batches::*,
-        unprocessed_transaction_storage::{ThreadType, UnprocessedTransactionStorage},
+        // unprocessed_transaction_storage::{ThreadType, UnprocessedTransactionStorage},
     },
     crossbeam_channel::RecvTimeoutError,
     histogram::Histogram,
@@ -333,11 +336,13 @@ impl Scheduler {
         tpu_vote_receiver: &BankingPacketReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         channels: &Buffers,
+        retry_receiver: &Receiver<ControlObj>,
     ) -> Self {
         let packet_receiver = non_vote_receiver.clone();
         let vote_packet_receiver = tpu_vote_receiver.clone();
         let poh_recorder = poh_recorder.clone();
         let channels = channels.clone();
+        let retry_receiver = retry_receiver.clone();
 
         let mut prioritized_buffer: MinMaxHeap<SchPacket> =
             MinMaxHeap::with_capacity(PRIORITIZED_BUFFER_SIZE);
@@ -346,10 +351,9 @@ impl Scheduler {
         let scheduler_thread_hdls = Builder::new()
             .name(format!("solSchStg"))
             .spawn(move || {
-                // let start = Instant::now();
-
                 let mut target_thread;
                 loop {
+                    // let start = Instant::now();
                     // packet batches from sigverify stage
                     let mut packet_batches = Scheduler::get_packet_batches(&packet_receiver);
                     let vote_packet_batches = Scheduler::get_packet_batches(&vote_packet_receiver);
@@ -362,6 +366,33 @@ impl Scheduler {
                         bank = working_bank.unwrap().working_bank
                     } else {
                         continue;
+                    }
+
+                    if !retry_receiver.is_empty() {
+                        let control_obj = retry_receiver.try_recv().unwrap();
+                        let tx = control_obj.sanitized_transaction;
+                        let accts = Self::get_accts_from_san_tx(tx.clone(), &bank);
+                        
+                        if control_obj.just_del == true {
+                            Self::update_lookup_table_after_exec(
+                                &mut acct_lookup_table,
+                                control_obj.thread_id as u64,
+                                accts.clone(),
+                            )
+                        } else {
+                            Self::update_lookup_table_after_exec(
+                                &mut acct_lookup_table,
+                                control_obj.thread_id as u64,
+                                accts.clone(),
+                            );
+
+                            prioritized_buffer.push(SchPacket {
+                                transaction: tx,
+                                packet: Packet::default(),
+                                priority: 0,
+                                accts,
+                            });
+                        }
                     }
 
                     for batch in packet_batches {
@@ -512,6 +543,22 @@ impl Scheduler {
         }
     }
 
+    fn update_lookup_table_after_exec(
+        lookup_table: &mut LookupTable,
+        target_thread: u64,
+        accts: Vec<Pubkey>,
+    ) {
+        for acct in accts {
+            if let Some(entry) = lookup_table.acct_lookup.get_mut(&acct) {
+                if let Some(value) = entry.get_mut(target_thread as usize) {
+                    if *value > 0 {
+                        *value -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn get_tx_meta_info(packet: &Packet, bank: &Bank) -> (SanitizedTransaction, u64, Vec<Pubkey>) {
         let sanitized_versioned_transaction = Scheduler::get_sanitized_transaction(packet);
         let tx = Scheduler::get_tx(&bank, &sanitized_versioned_transaction);
@@ -568,6 +615,20 @@ impl Scheduler {
         accts.to_vec()
     }
 
+    fn get_accts_from_san_tx(tx: SanitizedTransaction, bank: &Bank) -> Vec<Pubkey> {
+        let tx_accts = tx
+            .get_account_locks(bank.get_transaction_account_lock_limit())
+            .unwrap();
+        let mut ro_accts = tx_accts.readonly;
+        let wo_accts = tx_accts.writable;
+        ro_accts.extend(wo_accts);
+        let mut accts: Vec<Pubkey> = Vec::new();
+        for acct in ro_accts {
+            accts.push(*acct);
+        }
+        accts
+    }
+
     fn get_working_bank(poh_recorder: &Arc<RwLock<PohRecorder>>) -> Option<BankStart> {
         poh_recorder
             .read()
@@ -613,6 +674,7 @@ impl BankingStage {
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         receivers: Vec<Receiver<SchPacket>>,
+        retry_sender: &Sender<ControlObj>,
     ) -> Self {
         Self::new_num_threads(
             cluster_info,
@@ -628,6 +690,7 @@ impl BankingStage {
             bank_forks,
             prioritization_fee_cache,
             receivers,
+            retry_sender,
         )
     }
 
@@ -646,17 +709,20 @@ impl BankingStage {
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         receivers: Vec<Receiver<SchPacket>>,
+        retry_sender: &Sender<ControlObj>,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
         // This thread talks to poh_service and broadcasts the entries once they have been recorded.
         // Once an entry has been recorded, its blockhash is registered with the bank.
         let data_budget = Arc::new(DataBudget::default());
+        // let retry_sender = Arc::new(retry_sender).clone();
+        let retry_sender = retry_sender.clone();
         // let receivers = Arc::new(receivers.clone());
         // let batch_limit =
         // TOTAL_BUFFERED_PACKETS / ((num_threads - NUM_VOTE_PROCESSING_THREADS) as usize);
         // Keeps track of extraneous vote transactions for the vote threads
-        let _latest_unprocessed_votes = Arc::new(LatestUnprocessedVotes::new());
+        // let _latest_unprocessed_votes = Arc::new(LatestUnprocessedVotes::new());
         // Many banks that process transactions in parallel.
         let bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
             .map(|id| {
@@ -668,6 +734,7 @@ impl BankingStage {
                     _ => receivers.get(3).unwrap().clone(),
                 };
 
+                let retry_sender = retry_sender.clone();
                 let poh_recorder = poh_recorder.clone();
 
                 let committer = Committer::new(
@@ -693,7 +760,6 @@ impl BankingStage {
                 Builder::new()
                     .name(format!("solBanknStgTx{id:02}"))
                     .spawn(move || {
-                        // let mut packet_receiver = &packet_receiver;
                         let mut banking_stage_stats = BankingStageStats::new(id);
 
                         let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
@@ -710,12 +776,13 @@ impl BankingStage {
                                         &mut slot_metrics_tracker,
                                         &consumer,
                                         &decision_maker,
+                                        &retry_sender,
                                     ),
                                     "process_buffered_packets",
                                 );
-                                slot_metrics_tracker.increment_process_buffered_packets_us(
-                                    process_buffered_packets_time.as_us(),
-                                );
+                                // slot_metrics_tracker.increment_process_buffered_packets_us(
+                                //     process_buffered_packets_time.as_us(),
+                                // );
                                 last_metrics_update = Instant::now();
                             }
 
@@ -735,8 +802,8 @@ impl BankingStage {
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
         consumer: &Consumer,
         decision_maker: &DecisionMaker,
+        retry_sender: &Sender<ControlObj>,
     ) {
-
         let (decision, make_decision_time) =
             measure!(decision_maker.make_consume_or_forward_decision());
         let metrics_action = slot_metrics_tracker.check_leader_slot_boundary(decision.bank_start());
@@ -755,11 +822,12 @@ impl BankingStage {
                         packet_receiver,
                         banking_stage_stats,
                         slot_metrics_tracker,
+                        retry_sender,
                     ),
                     "consume_buffered_packets",
                 );
-                slot_metrics_tracker
-                    .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
+                // slot_metrics_tracker
+                //     .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
             }
             _ => (),
         }

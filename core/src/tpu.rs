@@ -2,6 +2,7 @@
 //! multi-stage transaction processing pipeline in software.
 
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE_MS;
+use solana_sdk::transaction::SanitizedTransaction;
 
 // use crate::banking_stage;
 use {
@@ -78,6 +79,11 @@ pub struct Tpu {
 }
 
 pub type Buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
+pub struct ControlObj{
+    pub sanitized_transaction: SanitizedTransaction,
+    pub thread_id: u32,
+    pub just_del: bool,
+} 
 
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
@@ -243,11 +249,12 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
+        let (retry_sender, retry_receiver): (Sender<ControlObj>, Receiver<ControlObj>) = bounded(32);
         let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> = vec![(); BANKING_THREADS]
             .into_iter()
             .map(|_| bounded(32))
             .collect();
-        let scheduler = Scheduler::new(&non_vote_receiver, &tpu_vote_receiver, poh_recorder, &channels);
+        let scheduler = Scheduler::new(&non_vote_receiver, &tpu_vote_receiver, poh_recorder, &channels, &retry_receiver);
 
         let receivers: Vec<Receiver<SchPacket>> = channels.into_iter().map(|(_, r)| r).collect();
         let banking_stage = BankingStage::new(
@@ -263,6 +270,7 @@ impl Tpu {
             bank_forks.clone(),
             prioritization_fee_cache,
             receivers,
+            &retry_sender,
         );
 
         let broadcast_stage = broadcast_type.new_broadcast_stage(

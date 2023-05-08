@@ -72,7 +72,9 @@ impl Ord for DeserializedPacket {
 
 #[derive(Debug)]
 pub struct PacketBatchInsertionMetrics {
+    #[allow(dead_code)]
     pub(crate) num_dropped_packets: usize,
+    #[allow(dead_code)]
     pub(crate) num_dropped_tracer_packets: usize,
 }
 

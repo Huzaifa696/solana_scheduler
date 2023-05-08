@@ -4530,41 +4530,28 @@ impl Bank {
         inc_new_counter_info!("bank-process_transactions", sanitized_txs.len());
         let mut error_counters = TransactionErrorMetrics::default();
 
-        let retryable_transaction_indexes: Vec<_> = batch
+        let conflict: Vec<bool> = batch
             .lock_results()
             .iter()
-            .enumerate()
-            .filter_map(|(index, res)| match res {
+            .filter_map(|res| match res {
                 // following are retryable errors
-                Err(TransactionError::AccountInUse) => {
-                    error_counters.account_in_use += 1;
-                    Some(index)
-                }
-                Err(TransactionError::WouldExceedMaxBlockCostLimit) => {
-                    error_counters.would_exceed_max_block_cost_limit += 1;
-                    Some(index)
-                }
-                Err(TransactionError::WouldExceedMaxVoteCostLimit) => {
-                    error_counters.would_exceed_max_vote_cost_limit += 1;
-                    Some(index)
-                }
-                Err(TransactionError::WouldExceedMaxAccountCostLimit) => {
-                    error_counters.would_exceed_max_account_cost_limit += 1;
-                    Some(index)
-                }
-                Err(TransactionError::WouldExceedAccountDataBlockLimit) => {
-                    error_counters.would_exceed_account_data_block_limit += 1;
-                    Some(index)
-                }
-                // following are non-retryable errors
-                Err(TransactionError::TooManyAccountLocks) => {
-                    error_counters.too_many_account_locks += 1;
-                    None
-                }
+                Err(
+                    TransactionError::AccountInUse
+                    | TransactionError::WouldExceedMaxBlockCostLimit
+                    | TransactionError::WouldExceedMaxVoteCostLimit
+                    | TransactionError::WouldExceedMaxAccountCostLimit
+                    | TransactionError::WouldExceedAccountDataBlockLimit
+                    | TransactionError::TooManyAccountLocks,
+                ) => Some(true),
                 Err(_) => None,
                 Ok(_) => None,
             })
             .collect();
+
+        let mut retryable_transaction_indexes: Vec<usize> = Vec::new();
+        if *conflict.get(0).unwrap() {
+            retryable_transaction_indexes.push(1);
+        }
 
         let mut check_time = Measure::start("check_transactions");
         let mut check_results = self.check_transactions(

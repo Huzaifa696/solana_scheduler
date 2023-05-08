@@ -13,7 +13,7 @@ pub(crate) fn next_leader_tpu(
 ) -> Option<(Pubkey, SocketAddr)> {
     next_leader_x(cluster_info, poh_recorder, |leader| leader.tpu)
 }
-
+#[allow(dead_code)]
 pub(crate) fn next_leader_tpu_forwards(
     cluster_info: &ClusterInfo,
     poh_recorder: &RwLock<PohRecorder>,

@@ -1,7 +1,7 @@
 use {
     crate::{
         leader_slot_banking_stage_timing_metrics::*,
-        unprocessed_transaction_storage::InsertPacketBatchSummary,
+        // unprocessed_transaction_storage::InsertPacketBatchSummary,
     },
     solana_poh::poh_recorder::BankStart,
     solana_runtime::transaction_error_metrics::*,
@@ -532,20 +532,20 @@ impl LeaderSlotMetricsTracker {
         }
     }
 
-    pub(crate) fn accumulate_insert_packet_batches_summary(
-        &mut self,
-        insert_packet_batches_summary: &InsertPacketBatchSummary,
-    ) {
-        self.increment_exceeded_buffer_limit_dropped_packets_count(
-            insert_packet_batches_summary.total_dropped_packets() as u64,
-        );
-        self.increment_dropped_gossip_vote_count(
-            insert_packet_batches_summary.dropped_gossip_packets() as u64,
-        );
-        self.increment_dropped_tpu_vote_count(
-            insert_packet_batches_summary.dropped_tpu_packets() as u64
-        );
-    }
+    // pub(crate) fn accumulate_insert_packet_batches_summary(
+    //     &mut self,
+    //     insert_packet_batches_summary: &InsertPacketBatchSummary,
+    // ) {
+    //     self.increment_exceeded_buffer_limit_dropped_packets_count(
+    //         insert_packet_batches_summary.total_dropped_packets() as u64,
+    //     );
+    //     self.increment_dropped_gossip_vote_count(
+    //         insert_packet_batches_summary.dropped_gossip_packets() as u64,
+    //     );
+    //     self.increment_dropped_tpu_vote_count(
+    //         insert_packet_batches_summary.dropped_tpu_packets() as u64
+    //     );
+    // }
 
     pub(crate) fn accumulate_transaction_errors(
         &mut self,
@@ -557,7 +557,7 @@ impl LeaderSlotMetricsTracker {
                 .accumulate(error_metrics);
         }
     }
-
+    #[allow(dead_code)]
     // Packet inflow/outflow/processing metrics
     pub(crate) fn increment_total_new_valid_packets(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
@@ -569,7 +569,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_newly_failed_sigverify_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -580,7 +580,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_exceeded_buffer_limit_dropped_packets_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -591,7 +591,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_newly_buffered_packets_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -602,7 +602,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_retryable_packets_filtered_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -613,7 +613,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_failed_forwarded_packets_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -624,7 +624,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_successful_forwarded_packets_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -635,7 +635,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_packet_batch_forward_failure_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -646,7 +646,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_cleared_from_buffer_after_forward_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -657,7 +657,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_forwardable_batches_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -668,7 +668,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_retryable_packets_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -679,7 +679,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn set_end_of_slot_unprocessed_buffer_len(&mut self, len: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             leader_slot_metrics
@@ -700,7 +700,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_receive_and_buffer_packets_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -744,7 +744,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_forward_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -756,7 +756,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_forward_and_hold_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -768,7 +768,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_process_packets_transactions_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -780,7 +780,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     // Processing packets timing metrics
     pub(crate) fn increment_transactions_from_packets_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
@@ -793,7 +793,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_process_transactions_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -805,7 +805,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_filter_retryable_packets_us(&mut self, us: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -817,7 +817,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_dropped_gossip_vote_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(
@@ -828,7 +828,7 @@ impl LeaderSlotMetricsTracker {
             );
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn increment_dropped_tpu_vote_count(&mut self, count: u64) {
         if let Some(leader_slot_metrics) = &mut self.leader_slot_metrics {
             saturating_add_assign!(

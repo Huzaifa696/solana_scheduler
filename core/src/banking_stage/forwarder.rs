@@ -2,10 +2,10 @@ use {
     super::{BankingStageStats, ForwardOption},
     crate::{
         forward_packet_batches_by_accounts::ForwardPacketBatchesByAccounts,
-        leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
+        // leader_slot_banking_stage_metrics::LeaderSlotMetricsTracker,
         next_leader::{next_leader_tpu_forwards, next_leader_tpu_vote},
         tracer_packet_stats::TracerPacketStats,
-        unprocessed_transaction_storage::UnprocessedTransactionStorage,
+        // unprocessed_transaction_storage::UnprocessedTransactionStorage,
     },
     solana_client::{connection_cache::ConnectionCache, tpu_connection::TpuConnection},
     solana_gossip::cluster_info::ClusterInfo,
@@ -49,91 +49,91 @@ impl Forwarder {
         }
     }
 
-    pub(crate) fn handle_forwarding(
-        &self,
-        unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
-        hold: bool,
-        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-        banking_stage_stats: &BankingStageStats,
-        tracer_packet_stats: &mut TracerPacketStats,
-    ) {
-        let forward_option = unprocessed_transaction_storage.forward_option();
+    // pub(crate) fn handle_forwarding(
+    //     &self,
+    //     unprocessed_transaction_storage: &mut UnprocessedTransactionStorage,
+    //     hold: bool,
+    //     slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+    //     banking_stage_stats: &BankingStageStats,
+    //     tracer_packet_stats: &mut TracerPacketStats,
+    // ) {
+    //     let forward_option = unprocessed_transaction_storage.forward_option();
 
-        // get current root bank from bank_forks, use it to sanitize transaction and
-        // load all accounts from address loader;
-        let current_bank = self.bank_forks.read().unwrap().root_bank();
+    //     // get current root bank from bank_forks, use it to sanitize transaction and
+    //     // load all accounts from address loader;
+    //     let current_bank = self.bank_forks.read().unwrap().root_bank();
 
-        let mut forward_packet_batches_by_accounts =
-            ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
+    //     let mut forward_packet_batches_by_accounts =
+    //         ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
 
-        // sanitize and filter packets that are no longer valid (could be too old, a duplicate of something
-        // already processed), then add to forwarding buffer.
-        let filter_forwarding_result = unprocessed_transaction_storage
-            .filter_forwardable_packets_and_add_batches(
-                current_bank,
-                &mut forward_packet_batches_by_accounts,
-            );
-        slot_metrics_tracker.increment_transactions_from_packets_us(
-            filter_forwarding_result.total_packet_conversion_us,
-        );
-        banking_stage_stats.packet_conversion_elapsed.fetch_add(
-            filter_forwarding_result.total_packet_conversion_us,
-            Ordering::Relaxed,
-        );
-        banking_stage_stats
-            .filter_pending_packets_elapsed
-            .fetch_add(
-                filter_forwarding_result.total_filter_packets_us,
-                Ordering::Relaxed,
-            );
+    //     // sanitize and filter packets that are no longer valid (could be too old, a duplicate of something
+    //     // already processed), then add to forwarding buffer.
+    //     let filter_forwarding_result = unprocessed_transaction_storage
+    //         .filter_forwardable_packets_and_add_batches(
+    //             current_bank,
+    //             &mut forward_packet_batches_by_accounts,
+    //         );
+    //     slot_metrics_tracker.increment_transactions_from_packets_us(
+    //         filter_forwarding_result.total_packet_conversion_us,
+    //     );
+    //     banking_stage_stats.packet_conversion_elapsed.fetch_add(
+    //         filter_forwarding_result.total_packet_conversion_us,
+    //         Ordering::Relaxed,
+    //     );
+    //     banking_stage_stats
+    //         .filter_pending_packets_elapsed
+    //         .fetch_add(
+    //             filter_forwarding_result.total_filter_packets_us,
+    //             Ordering::Relaxed,
+    //         );
 
-        forward_packet_batches_by_accounts
-            .iter_batches()
-            .filter(|&batch| !batch.is_empty())
-            .for_each(|forward_batch| {
-                slot_metrics_tracker.increment_forwardable_batches_count(1);
+    //     forward_packet_batches_by_accounts
+    //         .iter_batches()
+    //         .filter(|&batch| !batch.is_empty())
+    //         .for_each(|forward_batch| {
+    //             slot_metrics_tracker.increment_forwardable_batches_count(1);
 
-                let batched_forwardable_packets_count = forward_batch.len();
-                let (_forward_result, sucessful_forwarded_packets_count, leader_pubkey) = self
-                    .forward_buffered_packets(
-                        &forward_option,
-                        forward_batch.get_forwardable_packets(),
-                        banking_stage_stats,
-                    );
+    //             let batched_forwardable_packets_count = forward_batch.len();
+    //             let (_forward_result, sucessful_forwarded_packets_count, leader_pubkey) = self
+    //                 .forward_buffered_packets(
+    //                     &forward_option,
+    //                     forward_batch.get_forwardable_packets(),
+    //                     banking_stage_stats,
+    //                 );
 
-                if let Some(leader_pubkey) = leader_pubkey {
-                    tracer_packet_stats.increment_total_forwardable_tracer_packets(
-                        filter_forwarding_result.total_forwardable_tracer_packets,
-                        leader_pubkey,
-                    );
-                }
-                let failed_forwarded_packets_count = batched_forwardable_packets_count
-                    .saturating_sub(sucessful_forwarded_packets_count);
+    //             if let Some(leader_pubkey) = leader_pubkey {
+    //                 tracer_packet_stats.increment_total_forwardable_tracer_packets(
+    //                     filter_forwarding_result.total_forwardable_tracer_packets,
+    //                     leader_pubkey,
+    //                 );
+    //             }
+    //             let failed_forwarded_packets_count = batched_forwardable_packets_count
+    //                 .saturating_sub(sucessful_forwarded_packets_count);
 
-                if failed_forwarded_packets_count > 0 {
-                    slot_metrics_tracker.increment_failed_forwarded_packets_count(
-                        failed_forwarded_packets_count as u64,
-                    );
-                    slot_metrics_tracker.increment_packet_batch_forward_failure_count(1);
-                }
+    //             if failed_forwarded_packets_count > 0 {
+    //                 slot_metrics_tracker.increment_failed_forwarded_packets_count(
+    //                     failed_forwarded_packets_count as u64,
+    //                 );
+    //                 slot_metrics_tracker.increment_packet_batch_forward_failure_count(1);
+    //             }
 
-                if sucessful_forwarded_packets_count > 0 {
-                    slot_metrics_tracker.increment_successful_forwarded_packets_count(
-                        sucessful_forwarded_packets_count as u64,
-                    );
-                }
-            });
+    //             if sucessful_forwarded_packets_count > 0 {
+    //                 slot_metrics_tracker.increment_successful_forwarded_packets_count(
+    //                     sucessful_forwarded_packets_count as u64,
+    //                 );
+    //             }
+    //         });
 
-        if !hold {
-            slot_metrics_tracker.increment_cleared_from_buffer_after_forward_count(
-                filter_forwarding_result.total_forwardable_packets as u64,
-            );
-            tracer_packet_stats.increment_total_cleared_from_buffer_after_forward(
-                filter_forwarding_result.total_tracer_packets_in_buffer,
-            );
-            unprocessed_transaction_storage.clear_forwarded_packets();
-        }
-    }
+    //     if !hold {
+    //         slot_metrics_tracker.increment_cleared_from_buffer_after_forward_count(
+    //             filter_forwarding_result.total_forwardable_packets as u64,
+    //         );
+    //         tracer_packet_stats.increment_total_cleared_from_buffer_after_forward(
+    //             filter_forwarding_result.total_tracer_packets_in_buffer,
+    //         );
+    //         unprocessed_transaction_storage.clear_forwarded_packets();
+    //     }
+    // }
 
     /// Forwards all valid, unprocessed packets in the buffer, up to a rate limit. Returns
     /// the number of successfully forwarded packets in second part of tuple
