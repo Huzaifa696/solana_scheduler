@@ -372,7 +372,7 @@ impl Scheduler {
                         let control_obj = retry_receiver.try_recv().unwrap();
                         let tx = control_obj.sanitized_transaction;
                         let accts = Self::get_accts_from_san_tx(tx.clone(), &bank);
-                        
+
                         if control_obj.just_del == true {
                             Self::update_lookup_table_after_exec(
                                 &mut acct_lookup_table,
@@ -593,13 +593,17 @@ impl Scheduler {
     }
 
     fn get_packet_batches(non_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
-        Arc::try_unwrap(
-            non_vote_receiver
-                .recv_timeout(Duration::from_millis(20))
-                .unwrap(),
-        )
-        .unwrap()
-        .0
+        let packet_batch = non_vote_receiver.recv_timeout(Duration::from_millis(20));
+        if packet_batch.is_ok() {
+            let packet_batch = Arc::try_unwrap(packet_batch.unwrap());
+            if packet_batch.is_ok() {
+                return packet_batch.unwrap().0;
+            } else {
+                return Vec::new();
+            }
+        } else {
+            return Vec::new();
+        }
     }
 
     fn get_sanitized_transaction(packet: &Packet) -> SanitizedVersionedTransaction {

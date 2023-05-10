@@ -4549,8 +4549,10 @@ impl Bank {
             .collect();
 
         let mut retryable_transaction_indexes: Vec<usize> = Vec::new();
-        if *conflict.get(0).unwrap() {
-            retryable_transaction_indexes.push(1);
+        if conflict.get(0).is_some() {
+            if *conflict.get(0).unwrap() {
+                retryable_transaction_indexes.push(1);
+            }
         }
 
         let mut check_time = Measure::start("check_transactions");

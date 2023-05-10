@@ -152,7 +152,11 @@ impl Consumer {
 
         // let packets_to_process_len = packet_receiver.len();
 
-        let sch_packet = &packet_receiver.try_recv().unwrap();
+        let sch_packet = &packet_receiver.try_recv();
+        if sch_packet.clone().is_err() {
+            return;
+        }
+        let sch_packet = sch_packet.clone().unwrap();
         let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self
             .process_packets_transactions(
@@ -499,19 +503,30 @@ impl Consumer {
                 None, // account_overrides
                 self.log_messages_bytes_limit,
             ));
-        let tx = batch.clone().sanitized_transactions().get(0).unwrap().clone();
-        if *load_and_execute_transactions_output
-            .retryable_transaction_indexes
+        let tx = batch
+            .clone()
+            .sanitized_transactions()
             .get(0)
             .unwrap()
-            == 1
+            .clone();
+        if load_and_execute_transactions_output
+            .retryable_transaction_indexes
+            .get(0)
+            .is_some()
         {
-            let control_obj = ControlObj {
-                sanitized_transaction: tx,
-                thread_id: id,
-                just_del: false,
-            };
-            retry_sender.try_send(control_obj).unwrap();
+            if *load_and_execute_transactions_output
+                .retryable_transaction_indexes
+                .get(0)
+                .unwrap()
+                == 1
+            {
+                let control_obj = ControlObj {
+                    sanitized_transaction: tx,
+                    thread_id: id,
+                    just_del: false,
+                };
+                retry_sender.try_send(control_obj).unwrap();
+            }
         } else {
             let control_obj = ControlObj {
                 sanitized_transaction: tx,

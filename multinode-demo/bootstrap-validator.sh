@@ -146,12 +146,7 @@ args+=(
   --no-os-network-limits-test
   --no-wait-for-vote-to-start-leader
   --full-rpc-api
-<<<<<<< Updated upstream
   --allow-private-addr
-=======
-  # --bind-address 192.168.100.205
-  # --rpc-bind-address 192.168.100.205
->>>>>>> Stashed changes
 )
 default_arg --gossip-port 8001
 default_arg --log -
