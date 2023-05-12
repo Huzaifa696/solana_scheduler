@@ -330,6 +330,52 @@ const PRIORITIZED_BUFFER_SIZE: usize = 100_000;
 const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 // const  PACKET_BATCH_SIZE: usize = 64*64;
 
+#[derive(Default)]
+struct SchedulerStats {
+    end_to_end_time: u128,
+    packet_reception: u128,
+    working_bank: u128,
+    retry_and_garbage_collection: u128,
+    batch_processing: u128,
+    last_logged: u128,
+    loop_counter: u128,
+    tx_counter: u128,
+    tx_recv_counter: u128,
+    not_leader_counter: u128,
+    vote_counter: u128,
+    empty_buffer: u128,
+}
+
+impl SchedulerStats {
+    pub fn new() -> Self {
+        SchedulerStats {
+            end_to_end_time: 0,
+            packet_reception: 0,
+            working_bank: 0,
+            retry_and_garbage_collection: 0,
+            batch_processing: 0,
+            last_logged: 0,
+            loop_counter: 0,
+            tx_counter: 0,
+            tx_recv_counter: 0,
+            not_leader_counter: 0,
+            vote_counter: 0,
+            empty_buffer: 0,
+        }
+    }
+    // pub fn default() -> Self {
+    //     SchedulerStats {
+    //         end_to_end_time: 0,
+    //         packet_reception: 0,
+    //         working_bank: 0,
+    //         retry_and_garbage_collection: 0,
+    //         batch_processing: 0,
+    //         last_logged: 0,
+    //         loop_counter: 0,
+    //     }
+    // }
+}
+
 impl Scheduler {
     pub fn new(
         non_vote_receiver: &BankingPacketReceiver,
@@ -352,22 +398,31 @@ impl Scheduler {
             .name(format!("solSchStg"))
             .spawn(move || {
                 let mut target_thread;
+                let mut sch_stats = SchedulerStats::new();
+                // let mut accumalative_time = 0;
+                // let mut counter = 0;
                 loop {
-                    // let start = Instant::now();
+                    let mut start_start = Instant::now();
+                    let mut start = Instant::now();
                     // packet batches from sigverify stage
                     let mut packet_batches = Scheduler::get_packet_batches(&packet_receiver);
                     let vote_packet_batches = Scheduler::get_packet_batches(&vote_packet_receiver);
                     packet_batches.extend(vote_packet_batches);
+                    sch_stats.packet_reception += start.elapsed().as_micros();
 
+                    start = Instant::now();
                     // check if this validator is the current leader
                     let working_bank = Scheduler::get_working_bank(&poh_recorder);
                     let bank;
                     if working_bank.is_some() {
                         bank = working_bank.unwrap().working_bank
                     } else {
+                        sch_stats.not_leader_counter += 1;
                         continue;
                     }
+                    sch_stats.working_bank += start.elapsed().as_micros();
 
+                    start = Instant::now();
                     if !retry_receiver.is_empty() {
                         let control_obj = retry_receiver.try_recv().unwrap();
                         let tx = control_obj.sanitized_transaction;
@@ -394,14 +449,18 @@ impl Scheduler {
                             });
                         }
                     }
+                    sch_stats.retry_and_garbage_collection += start.elapsed().as_micros();
 
+                    start = Instant::now();
                     for batch in packet_batches {
-                        for packet in &batch {
+                        'pkt_loop: for packet in &batch {
+                            sch_stats.tx_recv_counter += 1;
                             // extracting data
                             let (sanitized_transaction, priority, accts) =
                                 Scheduler::get_tx_meta_info(packet, &bank);
 
                             if sanitized_transaction.is_simple_vote_transaction() {
+                                sch_stats.vote_counter += 1;
                                 let sch_packet = SchPacket {
                                     transaction: sanitized_transaction,
                                     packet: packet.clone(),
@@ -414,12 +473,13 @@ impl Scheduler {
                                     target_thread as u64,
                                     &sch_packet,
                                 );
+                                sch_stats.tx_counter += 1;
                                 let _sending_result = channels
                                     .get(target_thread as usize)
                                     .unwrap()
                                     .0
                                     .send(sch_packet);
-                                continue;
+                                continue 'pkt_loop;
                             }
 
                             prioritized_buffer.push(SchPacket {
@@ -437,6 +497,7 @@ impl Scheduler {
                                     &channels,
                                 ) as usize;
 
+                                sch_stats.tx_counter += 1;
                                 // send obj to the scheduled thread
                                 let _sending_result = channels
                                     .get(target_thread as usize)
@@ -444,16 +505,35 @@ impl Scheduler {
                                     .0
                                     .send(sch_packet);
                             } else {
+                                sch_stats.empty_buffer += 1;
                                 // in case the buffer is empty
-                                continue;
+                                continue 'pkt_loop;
                             }
                         }
                     }
+                    sch_stats.batch_processing += start.elapsed().as_micros();
 
-                    // let elapsed = start.elapsed();
-                    // if elapsed.as_secs() > 1 {
-                    //     println!("hello scheduler stage");
-                    // }
+                    let elapsed = start_start.elapsed().as_micros();
+                    sch_stats.last_logged += elapsed;
+                    sch_stats.loop_counter += 1;
+                    if sch_stats.last_logged > 1000000 {
+                        let c: u128 = sch_stats.loop_counter;
+                        info!(
+                            "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}",
+                            sch_stats.last_logged, 
+                            sch_stats.loop_counter, 
+                            sch_stats.packet_reception/c, 
+                            sch_stats.working_bank/c, 
+                            sch_stats.retry_and_garbage_collection/c, 
+                            sch_stats.batch_processing/c, 
+                            sch_stats.tx_counter,
+                            sch_stats.tx_recv_counter,
+                            sch_stats.not_leader_counter,
+                            sch_stats.vote_counter,
+                            sch_stats.empty_buffer,
+                        );
+                        sch_stats = SchedulerStats::default();
+                    }
                 }
             })
             .unwrap();
@@ -592,8 +672,8 @@ impl Scheduler {
         tx
     }
 
-    fn get_packet_batches(non_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
-        let packet_batch = non_vote_receiver.recv_timeout(Duration::from_millis(20));
+    fn get_packet_batches(receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
+        let packet_batch = receiver.recv_timeout(Duration::from_millis(10));
         if packet_batch.is_ok() {
             let packet_batch = Arc::try_unwrap(packet_batch.unwrap());
             if packet_batch.is_ok() {
@@ -769,7 +849,10 @@ impl BankingStage {
                         let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
                         let mut last_metrics_update = Instant::now();
 
+                        let mut accumalative_time = 0;
+                        let mut counter = 0;
                         loop {
+                            let start = Instant::now();
                             if packet_receiver.is_empty()
                                 || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
                             {
@@ -791,6 +874,18 @@ impl BankingStage {
                             }
 
                             banking_stage_stats.report(1000);
+
+                            let elapsed = start.elapsed().as_micros();
+                            accumalative_time += elapsed;
+                            counter += 1;
+                            if accumalative_time > 1000000 {
+                                info!(
+                                    "banking loop time {} and count {}",
+                                    accumalative_time, counter
+                                );
+                                accumalative_time = 0;
+                                counter = 0;
+                            }
                         }
                     })
                     .unwrap()

@@ -525,7 +525,7 @@ impl Consumer {
                     thread_id: id,
                     just_del: false,
                 };
-                retry_sender.try_send(control_obj).unwrap();
+                let _res = retry_sender.try_send(control_obj);
             }
         } else {
             let control_obj = ControlObj {
@@ -533,7 +533,7 @@ impl Consumer {
                 thread_id: id,
                 just_del: true,
             };
-            retry_sender.try_send(control_obj).unwrap();
+            let _res = retry_sender.try_send(control_obj);
         }
 
         execute_and_commit_timings.load_execute_us = load_execute_us;
