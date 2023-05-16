@@ -1,9 +1,11 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
+use solana_sdk::transaction::MAX_TX_ACCOUNT_LOCKS;
 use crate::tpu::ControlObj;
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
+use std::f32::consts::E;
 // use std::hash::Hash;
 use crossbeam_channel::Receiver;
 use min_max_heap::MinMaxHeap;
@@ -73,6 +75,8 @@ mod packet_receiver;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 6;
+pub const MAX_ACCTS_PER_TX: usize = 256;
+pub const ONE_SEC: u64 = 1000000;
 
 const TOTAL_BUFFERED_PACKETS: usize = 700_000;
 
@@ -287,16 +291,13 @@ pub struct BankingStage {
 
 struct LookupTable {
     acct_lookup: HashMap<Pubkey, Vec<u64>>,
-    lookup_results: Vec<Vec<u64>>,
 }
 
 impl LookupTable {
     fn new(capacity: usize) -> Self {
         let acct_lookup: HashMap<Pubkey, Vec<u64>> = HashMap::with_capacity(capacity);
-        let lookup_results: Vec<Vec<u64>> = Vec::with_capacity(capacity / 5);
         LookupTable {
             acct_lookup,
-            lookup_results,
         }
     }
 }
@@ -308,7 +309,6 @@ pub struct Scheduler {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SchPacket {
     transaction: SanitizedTransaction,
-    packet: Packet,
     priority: u64,
     accts: Vec<Pubkey>,
 }
@@ -332,18 +332,18 @@ const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 
 #[derive(Default)]
 struct SchedulerStats {
-    end_to_end_time: u128,
-    packet_reception: u128,
-    working_bank: u128,
-    retry_and_garbage_collection: u128,
-    batch_processing: u128,
-    last_logged: u128,
-    loop_counter: u128,
-    tx_counter: u128,
-    tx_recv_counter: u128,
-    not_leader_counter: u128,
-    vote_counter: u128,
-    empty_buffer: u128,
+    end_to_end_time: u64,
+    packet_reception: u64,
+    working_bank: u64,
+    retry_and_garbage_collection: u64,
+    batch_processing: u64,
+    last_logged: u64,
+    loop_counter: u64,
+    tx_counter: u64,
+    tx_recv_counter: u64,
+    not_leader_counter: u64,
+    vote_counter: u64,
+    empty_buffer: u64,
 }
 
 impl SchedulerStats {
@@ -363,17 +363,6 @@ impl SchedulerStats {
             empty_buffer: 0,
         }
     }
-    // pub fn default() -> Self {
-    //     SchedulerStats {
-    //         end_to_end_time: 0,
-    //         packet_reception: 0,
-    //         working_bank: 0,
-    //         retry_and_garbage_collection: 0,
-    //         batch_processing: 0,
-    //         last_logged: 0,
-    //         loop_counter: 0,
-    //     }
-    // }
 }
 
 impl Scheduler {
@@ -397,135 +386,46 @@ impl Scheduler {
         let scheduler_thread_hdls = Builder::new()
             .name(format!("solSchStg"))
             .spawn(move || {
-                let mut target_thread;
+                // let mut target_thread: _;
                 let mut sch_stats = SchedulerStats::new();
-                // let mut accumalative_time = 0;
-                // let mut counter = 0;
                 loop {
-                    let mut start_start = Instant::now();
-                    let mut start = Instant::now();
+                    let start = Instant::now();
+                    
+                    // bank required for deserialization of packet into transaction
+                    let (working_bank, working_bank_time_us) = measure_us!(Scheduler::is_bank_available(&poh_recorder));
+                    sch_stats.working_bank += working_bank_time_us;
+                    let bank = match working_bank {
+                        Some(bank) => bank,
+                        None => {sch_stats.not_leader_counter += 1; continue;},
+                    };                 
+                    
                     // packet batches from sigverify stage
-                    let mut packet_batches = Scheduler::get_packet_batches(&packet_receiver);
-                    let vote_packet_batches = Scheduler::get_packet_batches(&vote_packet_receiver);
-                    packet_batches.extend(vote_packet_batches);
-                    sch_stats.packet_reception += start.elapsed().as_micros();
-
-                    start = Instant::now();
-                    // check if this validator is the current leader
-                    let working_bank = Scheduler::get_working_bank(&poh_recorder);
-                    let bank;
-                    if working_bank.is_some() {
-                        bank = working_bank.unwrap().working_bank
-                    } else {
-                        sch_stats.not_leader_counter += 1;
-                        continue;
+                    let (packet_batches, packet_reception_time) = measure_us!(Scheduler::receive_packet_batches(&packet_receiver, &vote_packet_receiver));
+                    sch_stats.packet_reception += packet_reception_time;
+                    for batch in packet_batches.iter() {
+                        sch_stats.tx_recv_counter += batch.len() as u64;
                     }
-                    sch_stats.working_bank += start.elapsed().as_micros();
 
-                    start = Instant::now();
-                    if !retry_receiver.is_empty() {
-                        let control_obj = retry_receiver.try_recv().unwrap();
-                        let tx = control_obj.sanitized_transaction;
-                        let accts = Self::get_accts_from_san_tx(tx.clone(), &bank);
+                    // garbage collection 
+                    let (_, retry_and_garbage_collection_time) = measure_us!(Scheduler::retry_and_garbage_collection(&retry_receiver, &mut acct_lookup_table, &mut prioritized_buffer));
+                    sch_stats.retry_and_garbage_collection += retry_and_garbage_collection_time;
 
-                        if control_obj.just_del == true {
-                            Self::update_lookup_table_after_exec(
-                                &mut acct_lookup_table,
-                                control_obj.thread_id as u64,
-                                accts.clone(),
-                            )
-                        } else {
-                            Self::update_lookup_table_after_exec(
-                                &mut acct_lookup_table,
-                                control_obj.thread_id as u64,
-                                accts.clone(),
-                            );
+                    // batch processing
+                    let (_, batch_processing_time) = measure_us!(Scheduler::process_batches(packet_batches, &bank, &channels, &mut acct_lookup_table, &mut prioritized_buffer, &mut sch_stats));
+                    sch_stats.batch_processing += batch_processing_time;
 
-                            prioritized_buffer.push(SchPacket {
-                                transaction: tx,
-                                packet: Packet::default(),
-                                priority: 0,
-                                accts,
-                            });
-                        }
-                    }
-                    sch_stats.retry_and_garbage_collection += start.elapsed().as_micros();
-
-                    start = Instant::now();
-                    for batch in packet_batches {
-                        'pkt_loop: for packet in &batch {
-                            sch_stats.tx_recv_counter += 1;
-                            // extracting data
-                            let (sanitized_transaction, priority, accts) =
-                                Scheduler::get_tx_meta_info(packet, &bank);
-
-                            if sanitized_transaction.is_simple_vote_transaction() {
-                                sch_stats.vote_counter += 1;
-                                let sch_packet = SchPacket {
-                                    transaction: sanitized_transaction,
-                                    packet: packet.clone(),
-                                    priority,
-                                    accts,
-                                };
-                                target_thread = Self::find_least_loaded_thread(&channels);
-                                Self::update_lookup_table(
-                                    &mut acct_lookup_table,
-                                    target_thread as u64,
-                                    &sch_packet,
-                                );
-                                sch_stats.tx_counter += 1;
-                                let _sending_result = channels
-                                    .get(target_thread as usize)
-                                    .unwrap()
-                                    .0
-                                    .send(sch_packet);
-                                continue 'pkt_loop;
-                            }
-
-                            prioritized_buffer.push(SchPacket {
-                                transaction: sanitized_transaction,
-                                packet: packet.clone(),
-                                priority,
-                                accts,
-                            });
-
-                            if let Some(sch_packet) = prioritized_buffer.pop_max() {
-                                // Do something with the removed SchPacket
-                                target_thread = Scheduler::get_thread_number(
-                                    &sch_packet,
-                                    &mut acct_lookup_table,
-                                    &channels,
-                                ) as usize;
-
-                                sch_stats.tx_counter += 1;
-                                // send obj to the scheduled thread
-                                let _sending_result = channels
-                                    .get(target_thread as usize)
-                                    .unwrap()
-                                    .0
-                                    .send(sch_packet);
-                            } else {
-                                sch_stats.empty_buffer += 1;
-                                // in case the buffer is empty
-                                continue 'pkt_loop;
-                            }
-                        }
-                    }
-                    sch_stats.batch_processing += start.elapsed().as_micros();
-
-                    let elapsed = start_start.elapsed().as_micros();
-                    sch_stats.last_logged += elapsed;
+                    sch_stats.last_logged += start.elapsed().as_micros() as u64;
                     sch_stats.loop_counter += 1;
-                    if sch_stats.last_logged > 1000000 {
-                        let c: u128 = sch_stats.loop_counter;
+
+                    if sch_stats.last_logged > ONE_SEC {
                         info!(
                             "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}",
                             sch_stats.last_logged, 
                             sch_stats.loop_counter, 
-                            sch_stats.packet_reception/c, 
-                            sch_stats.working_bank/c, 
-                            sch_stats.retry_and_garbage_collection/c, 
-                            sch_stats.batch_processing/c, 
+                            sch_stats.packet_reception/sch_stats.loop_counter, 
+                            sch_stats.working_bank/sch_stats.loop_counter, 
+                            sch_stats.retry_and_garbage_collection/sch_stats.loop_counter, 
+                            sch_stats.batch_processing/sch_stats.loop_counter, 
                             sch_stats.tx_counter,
                             sch_stats.tx_recv_counter,
                             sch_stats.not_leader_counter,
@@ -540,6 +440,137 @@ impl Scheduler {
         Self {
             scheduler_thread_hdls,
         }
+    }
+
+    fn process_batches(packet_batches: Vec<PacketBatch>, bank: &Bank, channels: &Buffers, acct_lookup_table: &mut LookupTable, prioritized_buffer: &mut MinMaxHeap<SchPacket>, sch_stats: &mut SchedulerStats){
+        for batch in packet_batches {
+            let no_of_packets = batch.len() - 1;
+            'pkt_loop: for (i, packet) in batch.iter().enumerate() {
+
+                if Scheduler::check_discarded_packet(packet) == true {
+                    continue 'pkt_loop
+                };
+                // extracting data
+                let (sanitized_transaction, priority, accts) =
+                    Scheduler::get_tx_meta_info(packet, &bank);
+
+                if sanitized_transaction.is_simple_vote_transaction() {
+                    sch_stats.vote_counter += 1;
+                    Scheduler::handle_votes(&channels, sanitized_transaction, priority, accts);
+                    continue 'pkt_loop;
+                }
+
+                // if i == no_of_packets {
+                    // Last packet of the batch
+                    prioritized_buffer.push(SchPacket {
+                        transaction: sanitized_transaction,
+                        priority,
+                        accts,
+                    });
+
+                    while !prioritized_buffer.is_empty(){
+                        if let Some(sch_packet) = prioritized_buffer.pop_max() {
+                            let target_thread = Scheduler::get_thread_number(
+                                &sch_packet,
+                                acct_lookup_table,
+                                &channels,
+                            ) as usize;
+
+                            sch_stats.tx_counter += 1;
+                            let _sending_result = channels
+                                .get(target_thread as usize)
+                                .unwrap()
+                                .0
+                                .send(sch_packet);
+                        } else {
+                            sch_stats.empty_buffer += 1;
+                            // in case the buffer is empty
+                            continue 'pkt_loop;
+                        }
+                    }
+                // } else {
+                //     // Not the last iteration
+                //     prioritized_buffer.push(SchPacket {
+                //         transaction: sanitized_transaction,
+                //         priority,
+                //         accts,
+                //     });
+                // }
+            }
+        }
+    }
+
+    fn check_discarded_packet(packet: &Packet) -> bool {
+        if packet.meta().is_tracer_packet() || packet.meta().discard() || packet.meta().forwarded() {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_votes(channels: &Buffers, sanitized_transaction: SanitizedTransaction, priority: u64, accts: Vec<Pubkey>) {
+        let target_thread = Self::find_least_loaded_thread(&channels);
+        let _sending_result = channels
+            .get(target_thread as usize)
+            .unwrap()
+            .0
+            .send(SchPacket {
+                transaction: sanitized_transaction,
+                priority,
+                accts,
+            });
+    }
+
+    fn retry_and_garbage_collection(retry_receiver: &Receiver<ControlObj>, acct_lookup_table: &mut LookupTable, prioritized_buffer: &mut MinMaxHeap<SchPacket>) {
+        'retry_loop: while !retry_receiver.is_empty() {
+            let control_obj = match retry_receiver.try_recv() {
+                Ok(obj) => obj,
+                Err(_) => continue 'retry_loop,
+            };
+            let tx = control_obj.sanitized_transaction;
+            let accts = Self::get_accts_from_san_tx(tx.clone());
+
+            if !tx.is_simple_vote_transaction(){
+                if control_obj.just_del == true {
+                    Self::update_lookup_table_after_exec(
+                        acct_lookup_table,
+                        control_obj.thread_id as u64,
+                        accts.clone(),
+                    )
+                } else {
+                    Self::update_lookup_table_after_exec(
+                        acct_lookup_table,
+                        control_obj.thread_id as u64,
+                        accts.clone(),
+                    );
+        
+                    prioritized_buffer.push(SchPacket {
+                        transaction: tx,
+                        priority: 0,
+                        accts,
+                    });
+                }
+            }
+            else {
+                continue 'retry_loop;
+            }
+        } 
+    }
+
+    fn is_bank_available(poh_recorder: &Arc<RwLock<PohRecorder>>) -> Option<Arc<Bank>> {
+        let working_bank = Scheduler::get_working_bank(&poh_recorder);
+        if working_bank.is_some() {
+            Some(working_bank.unwrap().working_bank)
+        } else {
+            None
+        }    
+    }
+
+    fn receive_packet_batches(non_vote_receiver: &BankingPacketReceiver, tpu_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
+        let mut packet_batches = Scheduler::get_packet_batches(&non_vote_receiver);
+        let vote_packet_batches = Scheduler::get_packet_batches(&tpu_vote_receiver);
+        packet_batches.extend(vote_packet_batches);
+        packet_batches
     }
 
     fn find_least_loaded_thread(channels: &Buffers) -> usize {
@@ -560,22 +591,23 @@ impl Scheduler {
         channels: &Buffers,
     ) -> u64 {
         let target_thread;
+        let mut lookup_results: Vec<Vec<u64>> = Vec::with_capacity(MAX_TX_ACCOUNT_LOCKS);
         for acct in &sch_packet.accts {
             let entry = lookup_table.acct_lookup.get(acct);
             if entry.is_some() {
-                lookup_table.lookup_results.push(entry.unwrap().clone());
+                lookup_results.push(entry.unwrap().clone());
             }
         }
 
         // case 1: when no account is found in any thread
-        if lookup_table.lookup_results.is_empty() {
+        if lookup_results.is_empty() {
             target_thread = Self::find_least_loaded_thread(channels);
             Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-            lookup_table.lookup_results.clear();
+            // lookup_results.clear();
             return target_thread as u64;
         } else {
             let mut prev_thread_selection = 0;
-            for (i, entry) in lookup_table.lookup_results.iter().enumerate() {
+            for (i, entry) in lookup_results.iter().enumerate() {
                 let non_zero_values = entry.iter().filter(|&x| *x != 0);
                 if non_zero_values.count() == 1 {
                     if i == 0 {
@@ -589,20 +621,20 @@ impl Scheduler {
                                 target_thread as u64,
                                 sch_packet,
                             );
-                            lookup_table.lookup_results.clear();
+                            // lookup_results.clear();
                             return target_thread as u64;
                         }
                     }
                 } else {
                     target_thread = Self::find_least_loaded_thread(channels);
                     Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-                    lookup_table.lookup_results.clear();
+                    // lookup_results.clear();
                     return target_thread as u64;
                 }
             }
             target_thread = prev_thread_selection;
             Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-            lookup_table.lookup_results.clear();
+            // lookup_results.clear();
             return target_thread as u64;
         }
     }
@@ -699,9 +731,13 @@ impl Scheduler {
         accts.to_vec()
     }
 
-    fn get_accts_from_san_tx(tx: SanitizedTransaction, bank: &Bank) -> Vec<Pubkey> {
+    // fn get_accts_from_san_tx(tx: SanitizedTransaction, bank: &Bank) -> Vec<Pubkey> {
+    fn get_accts_from_san_tx(tx: SanitizedTransaction) -> Vec<Pubkey> {
+        // let tx_accts = tx
+        //     .get_account_locks(bank.get_transaction_account_lock_limit())
+        //     .unwrap();
         let tx_accts = tx
-            .get_account_locks(bank.get_transaction_account_lock_limit())
+            .get_account_locks(MAX_TX_ACCOUNT_LOCKS)
             .unwrap();
         let mut ro_accts = tx_accts.readonly;
         let wo_accts = tx_accts.writable;
@@ -886,6 +922,7 @@ impl BankingStage {
                                 accumalative_time = 0;
                                 counter = 0;
                             }
+                            // banking_stage_stats.report(1000);
                         }
                     })
                     .unwrap()

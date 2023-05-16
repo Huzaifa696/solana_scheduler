@@ -225,9 +225,9 @@ impl Consumer {
                 retry_sender
             ));
         // slot_metrics_tracker.increment_process_transactions_us(process_transactions_us);
-        // banking_stage_stats
-        //     .transaction_processing_elapsed
-        //     .fetch_add(process_transactions_us, Ordering::Relaxed);
+        banking_stage_stats
+            .transaction_processing_elapsed
+            .fetch_add(process_transactions_us, Ordering::Relaxed);
 
         // let ProcessTransactionsSummary {
         //     ref retryable_transaction_indexes,

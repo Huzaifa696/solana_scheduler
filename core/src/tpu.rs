@@ -61,6 +61,7 @@ pub struct TpuSockets {
 }
 
 pub const BANKING_THREADS: usize = 4;
+pub const CONTROLOBJ_CHANNEL_SIZE: usize = 32 * BANKING_THREADS;
 
 pub struct Tpu {
     fetch_stage: FetchStage,
@@ -79,11 +80,11 @@ pub struct Tpu {
 }
 
 pub type Buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
-pub struct ControlObj{
+pub struct ControlObj {
     pub sanitized_transaction: SanitizedTransaction,
     pub thread_id: u32,
     pub just_del: bool,
-} 
+}
 
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
@@ -249,12 +250,19 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        let (retry_sender, retry_receiver): (Sender<ControlObj>, Receiver<ControlObj>) = bounded(32);
+        let (retry_sender, retry_receiver): (Sender<ControlObj>, Receiver<ControlObj>) =
+            bounded(CONTROLOBJ_CHANNEL_SIZE);
         let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> = vec![(); BANKING_THREADS]
             .into_iter()
             .map(|_| bounded(32))
             .collect();
-        let scheduler = Scheduler::new(&non_vote_receiver, &tpu_vote_receiver, poh_recorder, &channels, &retry_receiver);
+        let scheduler = Scheduler::new(
+            &non_vote_receiver,
+            &tpu_vote_receiver,
+            poh_recorder,
+            &channels,
+            &retry_receiver,
+        );
 
         let receivers: Vec<Receiver<SchPacket>> = channels.into_iter().map(|(_, r)| r).collect();
         let banking_stage = BankingStage::new(
