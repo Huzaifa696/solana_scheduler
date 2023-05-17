@@ -13,7 +13,7 @@ with open('logs', 'r') as f:
 
 # use a regular expression to extract the numbers after "scheduler loop time"
 numbers = re.findall(
-    r'scheduler loop time (\d+), count (\d+), packet_reception (\d+), working_bank (\d+), retry_and_garbage_collection (\d+), batch_processing (\d+), tx_counter (\d+), tx_recv_counter (\d+), not_leader_counter (\d+), vote_counter (\d+), empty_buffer (\d+)', log_contents)
+    r'scheduler loop time (\d+), count (\d+), packet_reception (\d+), working_bank (\d+), retry_and_garbage_collection (\d+), batch_processing (\d+), buffering_time (\d+), un_buffering_time (\d+), tx_counter (\d+), tx_recv_counter (\d+), not_leader_counter (\d+), vote_counter (\d+), empty_buffer (\d+), buffered_packets (\d+)', log_contents)
 
 # join the numbers into a comma-separated string with a newline character between each line
 csv_string = '\n'.join(','.join(group) for group in numbers)

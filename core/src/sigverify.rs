@@ -3,7 +3,7 @@
 //! cores.  When perf-libs are available signature verification is offloaded
 //! to the GPU.
 //!
-
+use crossbeam_channel::Sender;
 pub use solana_perf::sigverify::{
     count_packets_in_batches, ed25519_verify_cpu, ed25519_verify_disabled, init, TxOffset,
 };
@@ -55,7 +55,7 @@ impl SigverifyTracerPacketStats {
 }
 
 pub struct TransactionSigVerifier {
-    packet_sender: BankingPacketSender,
+    packet_sender: Sender<Vec<PacketBatch>>,
     tracer_packet_stats: SigverifyTracerPacketStats,
     recycler: Recycler<TxOffset>,
     recycler_out: Recycler<PinnedVec<u8>>,
@@ -63,13 +63,13 @@ pub struct TransactionSigVerifier {
 }
 
 impl TransactionSigVerifier {
-    pub fn new_reject_non_vote(packet_sender: BankingPacketSender) -> Self {
+    pub fn new_reject_non_vote(packet_sender: Sender<Vec<PacketBatch>>) -> Self {
         let mut new_self = Self::new(packet_sender);
         new_self.reject_non_vote = true;
         new_self
     }
 
-    pub fn new(packet_sender: BankingPacketSender) -> Self {
+    pub fn new(packet_sender: Sender<Vec<PacketBatch>>) -> Self {
         init();
         Self {
             packet_sender,
@@ -126,10 +126,7 @@ impl SigVerifier for TransactionSigVerifier {
         packet_batches: Vec<PacketBatch>,
     ) -> Result<(), SigVerifyServiceError<Self::SendType>> {
         let tracer_packet_stats_to_send = std::mem::take(&mut self.tracer_packet_stats);
-        self.packet_sender.send(BankingPacketBatch::new((
-            packet_batches,
-            Some(tracer_packet_stats_to_send),
-        )))?;
+        self.packet_sender.send(packet_batches).unwrap();
         Ok(())
     }
 

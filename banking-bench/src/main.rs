@@ -227,7 +227,7 @@
 //     }
 // }
 
-fn main () {
+fn main() {
     println!("asdas");
 }
 

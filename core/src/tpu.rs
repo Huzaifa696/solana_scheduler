@@ -80,6 +80,7 @@ pub struct Tpu {
 }
 
 pub type Buffers = Vec<(Sender<SchPacket>, Receiver<SchPacket>)>;
+
 pub struct ControlObj {
     pub sanitized_transaction: SanitizedTransaction,
     pub thread_id: u32,
@@ -173,7 +174,8 @@ impl Tpu {
             "Vote",
         );
 
-        let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
+        // let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
+        let (non_vote_sender, non_vote_receiver) = unbounded();
 
         let stats = Arc::new(StreamStats::default());
         let (_, tpu_quic_t) = spawn_server(
@@ -222,6 +224,7 @@ impl Tpu {
         };
 
         let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
 
         let vote_sigverify_stage = {
             let verifier = TransactionSigVerifier::new_reject_non_vote(tpu_vote_sender);
@@ -251,10 +254,11 @@ impl Tpu {
         );
 
         let (retry_sender, retry_receiver): (Sender<ControlObj>, Receiver<ControlObj>) =
-            bounded(CONTROLOBJ_CHANNEL_SIZE);
+            unbounded();
+        // bounded(CONTROLOBJ_CHANNEL_SIZE);
         let channels: Vec<(Sender<SchPacket>, Receiver<SchPacket>)> = vec![(); BANKING_THREADS]
             .into_iter()
-            .map(|_| bounded(32))
+            .map(|_| unbounded())
             .collect();
         let scheduler = Scheduler::new(
             &non_vote_receiver,
@@ -268,9 +272,9 @@ impl Tpu {
         let banking_stage = BankingStage::new(
             cluster_info,
             poh_recorder,
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
+            // non_vote_receiver,
+            // tpu_vote_receiver,
+            // gossip_vote_receiver,
             transaction_status_sender,
             replay_vote_sender,
             log_messages_bytes_limit,

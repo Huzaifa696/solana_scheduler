@@ -1,11 +1,13 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
-use solana_sdk::transaction::MAX_TX_ACCOUNT_LOCKS;
+use crate::banking_trace::BankingPacketBatch;
 use crate::tpu::ControlObj;
 use crossbeam_channel::Sender;
+use solana_sdk::transaction::MAX_TX_ACCOUNT_LOCKS;
 use std::collections::HashMap;
 use std::f32::consts::E;
+use std::mem;
 // use std::hash::Hash;
 use crossbeam_channel::Receiver;
 use min_max_heap::MinMaxHeap;
@@ -296,9 +298,7 @@ struct LookupTable {
 impl LookupTable {
     fn new(capacity: usize) -> Self {
         let acct_lookup: HashMap<Pubkey, Vec<u64>> = HashMap::with_capacity(capacity);
-        LookupTable {
-            acct_lookup,
-        }
+        LookupTable { acct_lookup }
     }
 }
 
@@ -325,7 +325,7 @@ impl Ord for SchPacket {
     }
 }
 
-const PRIORITIZED_BUFFER_SIZE: usize = 100_000;
+const PRIORITIZED_BUFFER_SIZE: usize = 700_000;
 // const ACCT_ACCESS_LIST_SIZE: usize = 256;
 const ACCT_LOOKUP_TABLE_SIZE: usize = 11_000_000;
 // const  PACKET_BATCH_SIZE: usize = 64*64;
@@ -337,6 +337,8 @@ struct SchedulerStats {
     working_bank: u64,
     retry_and_garbage_collection: u64,
     batch_processing: u64,
+    buffering_time: u64,
+    un_buffering_time: u64,
     last_logged: u64,
     loop_counter: u64,
     tx_counter: u64,
@@ -344,6 +346,7 @@ struct SchedulerStats {
     not_leader_counter: u64,
     vote_counter: u64,
     empty_buffer: u64,
+    buffered_packets: u64,
 }
 
 impl SchedulerStats {
@@ -354,6 +357,8 @@ impl SchedulerStats {
             working_bank: 0,
             retry_and_garbage_collection: 0,
             batch_processing: 0,
+            buffering_time: 0,
+            un_buffering_time: 0,
             last_logged: 0,
             loop_counter: 0,
             tx_counter: 0,
@@ -361,14 +366,15 @@ impl SchedulerStats {
             not_leader_counter: 0,
             vote_counter: 0,
             empty_buffer: 0,
+            buffered_packets: 0,
         }
     }
 }
 
 impl Scheduler {
     pub fn new(
-        non_vote_receiver: &BankingPacketReceiver,
-        tpu_vote_receiver: &BankingPacketReceiver,
+        non_vote_receiver: &Receiver<Vec<PacketBatch>>,
+        tpu_vote_receiver: &Receiver<Vec<PacketBatch>>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         channels: &Buffers,
         retry_receiver: &Receiver<ControlObj>,
@@ -400,11 +406,11 @@ impl Scheduler {
                     };                 
                     
                     // packet batches from sigverify stage
-                    let (packet_batches, packet_reception_time) = measure_us!(Scheduler::receive_packet_batches(&packet_receiver, &vote_packet_receiver));
+                    let ((no_of_packets, packet_batches), packet_reception_time) = measure_us!(Scheduler::receive_packet_batches(&packet_receiver, &vote_packet_receiver, &mut prioritized_buffer));
                     sch_stats.packet_reception += packet_reception_time;
-                    for batch in packet_batches.iter() {
-                        sch_stats.tx_recv_counter += batch.len() as u64;
-                    }
+                    // for batch in packet_batches.iter() {
+                        sch_stats.tx_recv_counter += no_of_packets as u64;
+                    // }
 
                     // garbage collection 
                     let (_, retry_and_garbage_collection_time) = measure_us!(Scheduler::retry_and_garbage_collection(&retry_receiver, &mut acct_lookup_table, &mut prioritized_buffer));
@@ -419,18 +425,21 @@ impl Scheduler {
 
                     if sch_stats.last_logged > ONE_SEC {
                         info!(
-                            "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}",
+                            "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, buffering_time {}, un_buffering_time {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}, buffered_packets {}",
                             sch_stats.last_logged, 
                             sch_stats.loop_counter, 
                             sch_stats.packet_reception/sch_stats.loop_counter, 
                             sch_stats.working_bank/sch_stats.loop_counter, 
                             sch_stats.retry_and_garbage_collection/sch_stats.loop_counter, 
                             sch_stats.batch_processing/sch_stats.loop_counter, 
+                            sch_stats.buffering_time,
+                            sch_stats.un_buffering_time,
                             sch_stats.tx_counter,
                             sch_stats.tx_recv_counter,
                             sch_stats.not_leader_counter,
                             sch_stats.vote_counter,
                             sch_stats.empty_buffer,
+                            sch_stats.buffered_packets,
                         );
                         sch_stats = SchedulerStats::default();
                     }
@@ -442,73 +451,111 @@ impl Scheduler {
         }
     }
 
-    fn process_batches(packet_batches: Vec<PacketBatch>, bank: &Bank, channels: &Buffers, acct_lookup_table: &mut LookupTable, prioritized_buffer: &mut MinMaxHeap<SchPacket>, sch_stats: &mut SchedulerStats){
-        for batch in packet_batches {
-            let no_of_packets = batch.len() - 1;
-            'pkt_loop: for (i, packet) in batch.iter().enumerate() {
+    fn process_batches(
+        packet_batches: Vec<PacketBatch>,
+        bank: &Bank,
+        channels: &Buffers,
+        acct_lookup_table: &mut LookupTable,
+        prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+        sch_stats: &mut SchedulerStats,
+    ) {
+        // fill buffer
+        let (_, filling_time) = measure_us!(Scheduler::fill_buffer(
+            &packet_batches,
+            bank,
+            channels,
+            prioritized_buffer,
+            sch_stats,
+        ));
+        sch_stats.buffering_time += filling_time;
 
+        // emtpty buffer
+        let (_, popping_time) = measure_us!(Scheduler::schedule_and_send(
+            channels,
+            acct_lookup_table,
+            prioritized_buffer,
+            sch_stats
+        ));
+        sch_stats.un_buffering_time += popping_time;
+    }
+
+    fn schedule_and_send(
+        channels: &Buffers,
+        acct_lookup_table: &mut LookupTable,
+        prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+        sch_stats: &mut SchedulerStats,
+    ) {
+        while !prioritized_buffer.is_empty() {
+            if let Some(sch_packet) = prioritized_buffer.pop_max() {
+                let target_thread =
+                    Scheduler::get_thread_number(&sch_packet, acct_lookup_table, &channels)
+                        as usize;
+
+                sch_stats.tx_counter += 1;
+                let _sending_result = channels
+                    .get(target_thread as usize)
+                    .unwrap()
+                    .0
+                    .send(sch_packet);
+            } else {
+                // in case the buffer is empty
+                sch_stats.empty_buffer += 1;
+                return;
+            }
+        }
+    }
+
+    fn fill_buffer(
+        packet_batches: &Vec<PacketBatch>,
+        bank: &Bank,
+        channels: &Buffers,
+        prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+        sch_stats: &mut SchedulerStats,
+    ) {
+        for batch in packet_batches {
+            'pkt_loop: for (i, packet) in batch.iter().enumerate() {
+                // discard packets based on discarded flag
                 if Scheduler::check_discarded_packet(packet) == true {
-                    continue 'pkt_loop
+                    continue 'pkt_loop;
                 };
+
                 // extracting data
                 let (sanitized_transaction, priority, accts) =
                     Scheduler::get_tx_meta_info(packet, &bank);
 
+                // handle simple vote
                 if sanitized_transaction.is_simple_vote_transaction() {
                     sch_stats.vote_counter += 1;
                     Scheduler::handle_votes(&channels, sanitized_transaction, priority, accts);
                     continue 'pkt_loop;
                 }
 
-                // if i == no_of_packets {
-                    // Last packet of the batch
-                    prioritized_buffer.push(SchPacket {
-                        transaction: sanitized_transaction,
-                        priority,
-                        accts,
-                    });
-
-                    while !prioritized_buffer.is_empty(){
-                        if let Some(sch_packet) = prioritized_buffer.pop_max() {
-                            let target_thread = Scheduler::get_thread_number(
-                                &sch_packet,
-                                acct_lookup_table,
-                                &channels,
-                            ) as usize;
-
-                            sch_stats.tx_counter += 1;
-                            let _sending_result = channels
-                                .get(target_thread as usize)
-                                .unwrap()
-                                .0
-                                .send(sch_packet);
-                        } else {
-                            sch_stats.empty_buffer += 1;
-                            // in case the buffer is empty
-                            continue 'pkt_loop;
-                        }
-                    }
-                // } else {
-                //     // Not the last iteration
-                //     prioritized_buffer.push(SchPacket {
-                //         transaction: sanitized_transaction,
-                //         priority,
-                //         accts,
-                //     });
-                // }
+                // push in the prioritized buffer
+                prioritized_buffer.push(SchPacket {
+                    transaction: sanitized_transaction,
+                    priority,
+                    accts,
+                });
+                sch_stats.buffered_packets += 1;
             }
         }
     }
 
     fn check_discarded_packet(packet: &Packet) -> bool {
-        if packet.meta().is_tracer_packet() || packet.meta().discard() || packet.meta().forwarded() {
+        if packet.meta().is_tracer_packet() || packet.meta().discard() || packet.meta().forwarded()
+        {
             true
         } else {
             false
         }
     }
 
-    fn handle_votes(channels: &Buffers, sanitized_transaction: SanitizedTransaction, priority: u64, accts: Vec<Pubkey>) {
+    fn handle_votes(
+        channels: &Buffers,
+        sanitized_transaction: SanitizedTransaction,
+        priority: u64,
+        accts: Vec<Pubkey>,
+    ) {
         let target_thread = Self::find_least_loaded_thread(&channels);
         let _sending_result = channels
             .get(target_thread as usize)
@@ -521,7 +568,11 @@ impl Scheduler {
             });
     }
 
-    fn retry_and_garbage_collection(retry_receiver: &Receiver<ControlObj>, acct_lookup_table: &mut LookupTable, prioritized_buffer: &mut MinMaxHeap<SchPacket>) {
+    fn retry_and_garbage_collection(
+        retry_receiver: &Receiver<ControlObj>,
+        acct_lookup_table: &mut LookupTable,
+        prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+    ) {
         'retry_loop: while !retry_receiver.is_empty() {
             let control_obj = match retry_receiver.try_recv() {
                 Ok(obj) => obj,
@@ -530,31 +581,26 @@ impl Scheduler {
             let tx = control_obj.sanitized_transaction;
             let accts = Self::get_accts_from_san_tx(tx.clone());
 
-            if !tx.is_simple_vote_transaction(){
-                if control_obj.just_del == true {
-                    Self::update_lookup_table_after_exec(
-                        acct_lookup_table,
-                        control_obj.thread_id as u64,
-                        accts.clone(),
-                    )
-                } else {
-                    Self::update_lookup_table_after_exec(
-                        acct_lookup_table,
-                        control_obj.thread_id as u64,
-                        accts.clone(),
-                    );
-        
-                    prioritized_buffer.push(SchPacket {
-                        transaction: tx,
-                        priority: 0,
-                        accts,
-                    });
-                }
+            if control_obj.just_del == true {
+                Self::update_lookup_table_after_exec(
+                    acct_lookup_table,
+                    control_obj.thread_id as u64,
+                    accts.clone(),
+                )
+            } else {
+                Self::update_lookup_table_after_exec(
+                    acct_lookup_table,
+                    control_obj.thread_id as u64,
+                    accts.clone(),
+                );
+
+                prioritized_buffer.push(SchPacket {
+                    transaction: tx,
+                    priority: 0,
+                    accts,
+                });
             }
-            else {
-                continue 'retry_loop;
-            }
-        } 
+        }
     }
 
     fn is_bank_available(poh_recorder: &Arc<RwLock<PohRecorder>>) -> Option<Arc<Bank>> {
@@ -563,15 +609,96 @@ impl Scheduler {
             Some(working_bank.unwrap().working_bank)
         } else {
             None
-        }    
+        }
     }
 
-    fn receive_packet_batches(non_vote_receiver: &BankingPacketReceiver, tpu_vote_receiver: &BankingPacketReceiver) -> Vec<PacketBatch> {
-        let mut packet_batches = Scheduler::get_packet_batches(&non_vote_receiver);
-        let vote_packet_batches = Scheduler::get_packet_batches(&tpu_vote_receiver);
+    fn receive_packet_batches(
+        non_vote_receiver: &Receiver<Vec<PacketBatch>>,
+        tpu_vote_receiver: &Receiver<Vec<PacketBatch>>,
+        prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+    ) -> (usize, Vec<PacketBatch>) {
+        let capacity = prioritized_buffer.capacity() - prioritized_buffer.len();
+        let recv_timeout = Scheduler::get_receive_timeout(prioritized_buffer);
+
+        let (non_vote_packets, mut packet_batches) =
+            Scheduler::receive_until(non_vote_receiver, recv_timeout, capacity).unwrap();
+        let (vote_packets, vote_packet_batches) =
+            Scheduler::receive_until(tpu_vote_receiver, recv_timeout, capacity).unwrap();
+
+        // let mut packet_batches = Scheduler::get_packet_batches(&non_vote_receiver);
+        // let vote_packet_batches = Scheduler::get_packet_batches(&tpu_vote_receiver);
+
         packet_batches.extend(vote_packet_batches);
-        packet_batches
+        (non_vote_packets + vote_packets, packet_batches)
     }
+
+    fn get_receive_timeout(prioritized_buffer: &MinMaxHeap<SchPacket>) -> Duration {
+        if !prioritized_buffer.is_empty() {
+            Duration::from_millis(0)
+        } else {
+            // Default wait time
+            Duration::from_millis(100)
+        }
+    }
+
+    fn receive_until(
+        receiver: &Receiver<Vec<PacketBatch>>,
+        recv_timeout: Duration,
+        packet_count_upperbound: usize,
+    ) -> Result<(usize, Vec<PacketBatch>), RecvTimeoutError> {
+        let start = Instant::now();
+
+        let mut packet_batches = receiver.recv_timeout(recv_timeout)?;
+        let mut num_packets_received = packet_batches
+            .iter()
+            .map(|batch| batch.len())
+            .sum::<usize>();
+
+        while let Ok(message) = receiver.try_recv() {
+            let new_batches = message.clone();
+            trace!("got more packet batches in packet deserializer");
+            num_packets_received += new_batches.iter().map(|batch| batch.len()).sum::<usize>();
+            packet_batches.extend(new_batches);
+
+            if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
+                break;
+            }
+        }
+
+        Ok((num_packets_received, packet_batches))
+    }
+
+    // fn receive_until(
+    //     receiver: &Receiver<Vec<PacketBatch>>,
+    //     recv_timeout: Duration,
+    //     packet_count_upperbound: usize,
+    // ) -> Result<(usize, Vec<Vec<PacketBatch>>), RecvTimeoutError> {
+    //     let start = Instant::now();
+
+    //     let message = receiver.recv_timeout(recv_timeout)?;
+    //     let packet_batches = message.clone();
+    //     let mut num_packets_received = packet_batches
+    //         .iter()
+    //         .map(|batch| batch.len())
+    //         .sum::<usize>();
+    //     let mut messages = vec![message];
+
+    //     while let Ok(message) = receiver.try_recv() {
+    //         let packet_batches = message;
+    //         trace!("got more packet batches in packet deserializer");
+    //         num_packets_received += packet_batches
+    //             .iter()
+    //             .map(|batch| batch.len())
+    //             .sum::<usize>();
+    //         messages.push(message.clone());
+
+    //         if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
+    //             break;
+    //         }
+    //     }
+
+    //     Ok((num_packets_received, messages))
+    // }
 
     fn find_least_loaded_thread(channels: &Buffers) -> usize {
         let mut min = usize::MAX;
@@ -591,52 +718,41 @@ impl Scheduler {
         channels: &Buffers,
     ) -> u64 {
         let target_thread;
-        let mut lookup_results: Vec<Vec<u64>> = Vec::with_capacity(MAX_TX_ACCOUNT_LOCKS);
-        for acct in &sch_packet.accts {
-            let entry = lookup_table.acct_lookup.get(acct);
-            if entry.is_some() {
-                lookup_results.push(entry.unwrap().clone());
-            }
-        }
+        let mut prev_thread_selection = 1000; // random number to detect initial value
+        for acct in sch_packet.accts.iter() {
+            let mut single_thread: bool = false;
 
-        // case 1: when no account is found in any thread
-        if lookup_results.is_empty() {
-            target_thread = Self::find_least_loaded_thread(channels);
-            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-            // lookup_results.clear();
-            return target_thread as u64;
-        } else {
-            let mut prev_thread_selection = 0;
-            for (i, entry) in lookup_results.iter().enumerate() {
-                let non_zero_values = entry.iter().filter(|&x| *x != 0);
-                if non_zero_values.count() == 1 {
-                    if i == 0 {
-                        prev_thread_selection = entry.iter().position(|&x| x != 0).unwrap();
-                    } else if i != 0 {
-                        if prev_thread_selection == entry.iter().position(|&x| x != 0).unwrap() {
-                        } else {
-                            target_thread = Self::find_least_loaded_thread(channels);
-                            Self::update_lookup_table(
-                                lookup_table,
-                                target_thread as u64,
-                                sch_packet,
-                            );
-                            // lookup_results.clear();
-                            return target_thread as u64;
-                        }
+            for (i, x) in lookup_table
+                .acct_lookup
+                .get(acct)
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                if *x == 0 {
+                    continue;
+                } else if single_thread == false {
+                    single_thread = true;
+                    if prev_thread_selection == 1000 {
+                        prev_thread_selection = i;
+                    } else if prev_thread_selection == i {
+                    } else {
+                        target_thread = Self::find_least_loaded_thread(channels);
+                        Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
+                        return target_thread as u64;
                     }
+
+                    continue;
                 } else {
                     target_thread = Self::find_least_loaded_thread(channels);
                     Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-                    // lookup_results.clear();
                     return target_thread as u64;
                 }
             }
-            target_thread = prev_thread_selection;
-            Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-            // lookup_results.clear();
-            return target_thread as u64;
         }
+        target_thread = prev_thread_selection;
+        Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
+        return target_thread as u64;
     }
 
     fn update_lookup_table(
@@ -736,9 +852,7 @@ impl Scheduler {
         // let tx_accts = tx
         //     .get_account_locks(bank.get_transaction_account_lock_limit())
         //     .unwrap();
-        let tx_accts = tx
-            .get_account_locks(MAX_TX_ACCOUNT_LOCKS)
-            .unwrap();
+        let tx_accts = tx.get_account_locks(MAX_TX_ACCOUNT_LOCKS).unwrap();
         let mut ro_accts = tx_accts.readonly;
         let wo_accts = tx_accts.writable;
         ro_accts.extend(wo_accts);
@@ -784,9 +898,9 @@ impl BankingStage {
     pub fn new(
         cluster_info: &Arc<ClusterInfo>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        non_vote_receiver: BankingPacketReceiver,
-        tpu_vote_receiver: BankingPacketReceiver,
-        gossip_vote_receiver: BankingPacketReceiver,
+        // non_vote_receiver: BankingPacketReceiver,
+        // tpu_vote_receiver: BankingPacketReceiver,
+        // gossip_vote_receiver: BankingPacketReceiver,
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
@@ -799,9 +913,9 @@ impl BankingStage {
         Self::new_num_threads(
             cluster_info,
             poh_recorder,
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
+            // non_vote_receiver,
+            // tpu_vote_receiver,
+            // gossip_vote_receiver,
             Self::num_threads(),
             transaction_status_sender,
             replay_vote_sender,
@@ -818,9 +932,9 @@ impl BankingStage {
     pub fn new_num_threads(
         cluster_info: &Arc<ClusterInfo>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        non_vote_receiver: BankingPacketReceiver,
-        tpu_vote_receiver: BankingPacketReceiver,
-        _gossip_vote_receiver: BankingPacketReceiver,
+        // non_vote_receiver: BankingPacketReceiver,
+        // tpu_vote_receiver: BankingPacketReceiver,
+        // _gossip_vote_receiver: BankingPacketReceiver,
         num_threads: u32,
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: ReplayVoteSender,
@@ -903,9 +1017,9 @@ impl BankingStage {
                                     ),
                                     "process_buffered_packets",
                                 );
-                                // slot_metrics_tracker.increment_process_buffered_packets_us(
-                                //     process_buffered_packets_time.as_us(),
-                                // );
+                                slot_metrics_tracker.increment_process_buffered_packets_us(
+                                    process_buffered_packets_time.as_us(),
+                                );
                                 last_metrics_update = Instant::now();
                             }
 
@@ -962,8 +1076,8 @@ impl BankingStage {
                     ),
                     "consume_buffered_packets",
                 );
-                // slot_metrics_tracker
-                //     .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
+                slot_metrics_tracker
+                    .increment_consume_buffered_packets_us(consume_buffered_packets_time.as_us());
             }
             _ => (),
         }

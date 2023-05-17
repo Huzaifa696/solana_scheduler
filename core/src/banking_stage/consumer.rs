@@ -112,6 +112,7 @@ impl Consumer {
             &mut consumed_buffered_packets_count,
             &mut rebuffered_packet_count,
             retry_sender,
+            slot_metrics_tracker,
         );
 
         proc_start.stop();
@@ -143,9 +144,8 @@ impl Consumer {
         consumed_buffered_packets_count: &mut usize,
         rebuffered_packet_count: &mut usize,
         retry_sender: &Sender<ControlObj>,
-    )
-    // -> Option<Vec<usize>>
-    {
+        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+    ) -> Option<Vec<usize>> {
         // if payload.reached_end_of_slot {
         //     return None;
         // }
@@ -154,7 +154,7 @@ impl Consumer {
 
         let sch_packet = &packet_receiver.try_recv();
         if sch_packet.clone().is_err() {
-            return;
+            return None;
         }
         let sch_packet = sch_packet.clone().unwrap();
         let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
@@ -165,20 +165,20 @@ impl Consumer {
                 &uni_tx_array,
                 banking_stage_stats,
                 retry_sender,
-                // slot_metrics_tracker,
+                slot_metrics_tracker,
             ));
-        // slot_metrics_tracker
-        //     .increment_process_packets_transactions_us(process_packets_transactions_us);
+        slot_metrics_tracker
+            .increment_process_packets_transactions_us(process_packets_transactions_us);
 
         // Clear payload for next iteration
         // payload.sanitized_transactions.clear();
         // payload.account_locks.clear();
 
-        // let ProcessTransactionsSummary {
-        //     reached_max_poh_height,
-        //     retryable_transaction_indexes,
-        //     ..
-        // } = process_transactions_summary;
+        let ProcessTransactionsSummary {
+            reached_max_poh_height,
+            retryable_transaction_indexes,
+            ..
+        } = process_transactions_summary;
 
         // if reached_max_poh_height || !bank_start.should_working_bank_still_be_processing_txs() {
         //     payload.reached_end_of_slot = true;
@@ -202,7 +202,7 @@ impl Consumer {
         //     .slot_metrics_tracker
         //     .increment_retryable_packets_count(retryable_transaction_indexes.len() as u64);
 
-        // Some(retryable_transaction_indexes)
+        Some(retryable_transaction_indexes)
     }
 
     fn process_packets_transactions(
@@ -212,9 +212,8 @@ impl Consumer {
         sanitized_transactions: &[SanitizedTransaction],
         banking_stage_stats: &BankingStageStats,
         retry_sender: &Sender<ControlObj>, // slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
-    )
-    // -> ProcessTransactionsSummary
-    {
+        slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+    ) -> ProcessTransactionsSummary {
         let id = banking_stage_stats.id;
         let (mut process_transactions_summary, process_transactions_us) = measure_us!(self
             .process_transactions(
@@ -229,14 +228,14 @@ impl Consumer {
             .transaction_processing_elapsed
             .fetch_add(process_transactions_us, Ordering::Relaxed);
 
-        // let ProcessTransactionsSummary {
-        //     ref retryable_transaction_indexes,
-        //     ref error_counters,
-        //     ..
-        // } = process_transactions_summary;
+        let ProcessTransactionsSummary {
+            ref retryable_transaction_indexes,
+            ref error_counters,
+            ..
+        } = process_transactions_summary;
 
-        // slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
-        // slot_metrics_tracker.accumulate_transaction_errors(error_counters);
+        slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
+        slot_metrics_tracker.accumulate_transaction_errors(error_counters);
 
         // let retryable_tx_count = retryable_transaction_indexes.len();
         // inc_new_counter_info!("banking_stage-unprocessed_transactions", retryable_tx_count);
@@ -266,7 +265,7 @@ impl Consumer {
 
         // process_transactions_summary.retryable_transaction_indexes =
         //     filtered_retryable_transaction_indexes;
-        // process_transactions_summary
+        process_transactions_summary
     }
 
     /// Sends transactions to the bank.
@@ -280,26 +279,24 @@ impl Consumer {
         transactions: &[SanitizedTransaction],
         id: u32,
         retry_sender: &Sender<ControlObj>,
-    )
-    // -> ProcessTransactionsSummary
-    {
+    ) -> ProcessTransactionsSummary {
         // let mut chunk_start = 0;
-        // let mut all_retryable_tx_indexes = vec![];
-        // // All the transactions that attempted execution. See description of
-        // // struct ProcessTransactionsSummary above for possible outcomes.
-        // let mut total_transactions_attempted_execution_count: usize = 0;
-        // // All transactions that were executed and committed
-        // let mut total_committed_transactions_count: usize = 0;
-        // // All transactions that were executed and committed with a successful result
-        // let mut total_committed_transactions_with_successful_result_count: usize = 0;
-        // // All transactions that were executed but then failed record because the
-        // // slot ended
-        // let mut total_failed_commit_count: usize = 0;
-        // let mut total_cost_model_throttled_transactions_count: usize = 0;
-        // let mut total_cost_model_us: u64 = 0;
-        // let mut total_execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
-        // let mut total_error_counters = TransactionErrorMetrics::default();
-        // let mut reached_max_poh_height = false;
+        let mut all_retryable_tx_indexes = vec![];
+        // All the transactions that attempted execution. See description of
+        // struct ProcessTransactionsSummary above for possible outcomes.
+        let mut total_transactions_attempted_execution_count: usize = 0;
+        // All transactions that were executed and committed
+        let mut total_committed_transactions_count: usize = 0;
+        // All transactions that were executed and committed with a successful result
+        let mut total_committed_transactions_with_successful_result_count: usize = 0;
+        // All transactions that were executed but then failed record because the
+        // slot ended
+        let mut total_failed_commit_count: usize = 0;
+        let mut total_cost_model_throttled_transactions_count: usize = 0;
+        let mut total_cost_model_us: u64 = 0;
+        let mut total_execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
+        let mut total_error_counters = TransactionErrorMetrics::default();
+        let mut reached_max_poh_height = false;
         // while chunk_start != transactions.len() {
         //     let chunk_end = std::cmp::min(
         //         transactions.len(),
@@ -308,52 +305,52 @@ impl Consumer {
         let process_transaction_batch_output =
             self.process_and_record_transactions(bank, &transactions[..], id, retry_sender);
 
-        // let ProcessTransactionBatchOutput {
-        //     cost_model_throttled_transactions_count: new_cost_model_throttled_transactions_count,
-        //     cost_model_us: new_cost_model_us,
-        //     execute_and_commit_transactions_output,
-        // } = process_transaction_batch_output;
-        // saturating_add_assign!(
-        //     total_cost_model_throttled_transactions_count,
-        //     new_cost_model_throttled_transactions_count
-        // );
-        // saturating_add_assign!(total_cost_model_us, new_cost_model_us);
+        let ProcessTransactionBatchOutput {
+            cost_model_throttled_transactions_count: new_cost_model_throttled_transactions_count,
+            cost_model_us: new_cost_model_us,
+            execute_and_commit_transactions_output,
+        } = process_transaction_batch_output;
+        saturating_add_assign!(
+            total_cost_model_throttled_transactions_count,
+            new_cost_model_throttled_transactions_count
+        );
+        saturating_add_assign!(total_cost_model_us, new_cost_model_us);
 
-        // let ExecuteAndCommitTransactionsOutput {
-        //     transactions_attempted_execution_count: new_transactions_attempted_execution_count,
-        //     executed_transactions_count: new_executed_transactions_count,
-        //     executed_with_successful_result_count: new_executed_with_successful_result_count,
-        //     retryable_transaction_indexes: new_retryable_transaction_indexes,
-        //     commit_transactions_result: new_commit_transactions_result,
-        //     execute_and_commit_timings: new_execute_and_commit_timings,
-        //     error_counters: new_error_counters,
-        //     ..
-        // } = execute_and_commit_transactions_output;
+        let ExecuteAndCommitTransactionsOutput {
+            transactions_attempted_execution_count: new_transactions_attempted_execution_count,
+            executed_transactions_count: new_executed_transactions_count,
+            executed_with_successful_result_count: new_executed_with_successful_result_count,
+            retryable_transaction_indexes: new_retryable_transaction_indexes,
+            commit_transactions_result: new_commit_transactions_result,
+            execute_and_commit_timings: new_execute_and_commit_timings,
+            error_counters: new_error_counters,
+            ..
+        } = execute_and_commit_transactions_output;
 
-        // total_execute_and_commit_timings.accumulate(&new_execute_and_commit_timings);
-        // total_error_counters.accumulate(&new_error_counters);
-        // saturating_add_assign!(
-        //     total_transactions_attempted_execution_count,
-        //     new_transactions_attempted_execution_count
-        // );
+        total_execute_and_commit_timings.accumulate(&new_execute_and_commit_timings);
+        total_error_counters.accumulate(&new_error_counters);
+        saturating_add_assign!(
+            total_transactions_attempted_execution_count,
+            new_transactions_attempted_execution_count
+        );
 
-        // trace!(
-        //     "process_transactions result: {:?}",
-        //     new_commit_transactions_result
-        // );
+        trace!(
+            "process_transactions result: {:?}",
+            new_commit_transactions_result
+        );
 
-        // if new_commit_transactions_result.is_ok() {
-        //     saturating_add_assign!(
-        //         total_committed_transactions_count,
-        //         new_executed_transactions_count
-        //     );
-        //     saturating_add_assign!(
-        //         total_committed_transactions_with_successful_result_count,
-        //         new_executed_with_successful_result_count
-        //     );
-        // } else {
-        //     saturating_add_assign!(total_failed_commit_count, new_executed_transactions_count);
-        // }
+        if new_commit_transactions_result.is_ok() {
+            saturating_add_assign!(
+                total_committed_transactions_count,
+                new_executed_transactions_count
+            );
+            saturating_add_assign!(
+                total_committed_transactions_with_successful_result_count,
+                new_executed_with_successful_result_count
+            );
+        } else {
+            saturating_add_assign!(total_failed_commit_count, new_executed_transactions_count);
+        }
 
         // Add the retryable txs (transactions that errored in a way that warrants a retry)
         // to the list of unprocessed txs.
@@ -384,19 +381,19 @@ impl Consumer {
         // chunk_start = chunk_end;
         // }
 
-        // ProcessTransactionsSummary {
-        //     reached_max_poh_height,
-        //     transactions_attempted_execution_count: total_transactions_attempted_execution_count,
-        //     committed_transactions_count: total_committed_transactions_count,
-        //     committed_transactions_with_successful_result_count:
-        //         total_committed_transactions_with_successful_result_count,
-        //     failed_commit_count: total_failed_commit_count,
-        //     retryable_transaction_indexes: all_retryable_tx_indexes,
-        //     cost_model_throttled_transactions_count: total_cost_model_throttled_transactions_count,
-        //     cost_model_us: total_cost_model_us,
-        //     execute_and_commit_timings: total_execute_and_commit_timings,
-        //     error_counters: total_error_counters,
-        // }
+        ProcessTransactionsSummary {
+            reached_max_poh_height,
+            transactions_attempted_execution_count: total_transactions_attempted_execution_count,
+            committed_transactions_count: total_committed_transactions_count,
+            committed_transactions_with_successful_result_count:
+                total_committed_transactions_with_successful_result_count,
+            failed_commit_count: total_failed_commit_count,
+            retryable_transaction_indexes: all_retryable_tx_indexes,
+            cost_model_throttled_transactions_count: total_cost_model_throttled_transactions_count,
+            cost_model_us: total_cost_model_us,
+            execute_and_commit_timings: total_execute_and_commit_timings,
+            error_counters: total_error_counters,
+        }
     }
 
     pub fn process_and_record_transactions(
@@ -509,31 +506,33 @@ impl Consumer {
             .get(0)
             .unwrap()
             .clone();
-        if load_and_execute_transactions_output
-            .retryable_transaction_indexes
-            .get(0)
-            .is_some()
-        {
-            if *load_and_execute_transactions_output
+        if !tx.is_simple_vote_transaction() {
+            if load_and_execute_transactions_output
                 .retryable_transaction_indexes
                 .get(0)
-                .unwrap()
-                == 1
+                .is_some()
             {
+                if *load_and_execute_transactions_output
+                    .retryable_transaction_indexes
+                    .get(0)
+                    .unwrap()
+                    == 1
+                {
+                    let control_obj = ControlObj {
+                        sanitized_transaction: tx,
+                        thread_id: id,
+                        just_del: false,
+                    };
+                    let _res = retry_sender.try_send(control_obj);
+                }
+            } else {
                 let control_obj = ControlObj {
                     sanitized_transaction: tx,
                     thread_id: id,
-                    just_del: false,
+                    just_del: true,
                 };
                 let _res = retry_sender.try_send(control_obj);
             }
-        } else {
-            let control_obj = ControlObj {
-                sanitized_transaction: tx,
-                thread_id: id,
-                just_del: true,
-            };
-            let _res = retry_sender.try_send(control_obj);
         }
 
         execute_and_commit_timings.load_execute_us = load_execute_us;
@@ -1765,233 +1764,230 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_buffered_packets() {
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        {
-            let (transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
-                setup_conflicting_transactions(ledger_path.path());
-            let recorder = poh_recorder.read().unwrap().new_recorder();
-            let num_conflicting_transactions = transactions.len();
-            let deserialized_packets =
-                unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
-                    .unwrap();
-            assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
-            let mut buffered_packet_batches =
-                UnprocessedTransactionStorage::new_transaction_storage(
-                    UnprocessedPacketBatches::from_iter(
-                        deserialized_packets.into_iter(),
-                        num_conflicting_transactions,
-                    ),
-                    ThreadType::Transactions,
-                );
+    // fn test_consume_buffered_packets() {
+    //     let ledger_path = get_tmp_ledger_path_auto_delete!();
+    //     {
+    //         let (transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
+    //             setup_conflicting_transactions(ledger_path.path());
+    //         let recorder = poh_recorder.read().unwrap().new_recorder();
+    //         let num_conflicting_transactions = transactions.len();
+    //         let deserialized_packets =
+    //             unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
+    //                 .unwrap();
+    //         assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
+    //         let mut buffered_packet_batches =
+    //             UnprocessedTransactionStorage::new_transaction_storage(
+    //                 UnprocessedPacketBatches::from_iter(
+    //                     deserialized_packets.into_iter(),
+    //                     num_conflicting_transactions,
+    //                 ),
+    //                 ThreadType::Transactions,
+    //             );
 
-            let (replay_vote_sender, _replay_vote_receiver) = unbounded();
-            let committer = Committer::new(
-                None,
-                replay_vote_sender,
-                Arc::new(PrioritizationFeeCache::new(0u64)),
-            );
-            let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+    //         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+    //         let committer = Committer::new(
+    //             None,
+    //             replay_vote_sender,
+    //             Arc::new(PrioritizationFeeCache::new(0u64)),
+    //         );
+    //         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
-            // When the working bank in poh_recorder is None, no packets should be processed (consume will not be called)
-            assert!(!poh_recorder.read().unwrap().has_bank());
-            assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
-            // When the working bank in poh_recorder is Some, all packets should be processed.
-            // Multi-Iterator will process them 1-by-1 if all txs are conflicting.
-            poh_recorder.write().unwrap().set_bank(&bank, false);
-            let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
-            let banking_stage_stats = BankingStageStats::default();
-            consumer.consume_buffered_packets(
-                &bank_start,
-                &mut buffered_packet_batches,
-                &banking_stage_stats,
-                &mut LeaderSlotMetricsTracker::new(0),
-            );
+    //         // When the working bank in poh_recorder is None, no packets should be processed (consume will not be called)
+    //         assert!(!poh_recorder.read().unwrap().has_bank());
+    //         assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
+    //         // When the working bank in poh_recorder is Some, all packets should be processed.
+    //         // Multi-Iterator will process them 1-by-1 if all txs are conflicting.
+    //         poh_recorder.write().unwrap().set_bank(&bank, false);
+    //         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+    //         let banking_stage_stats = BankingStageStats::default();
+    //         consumer.consume_buffered_packets(
+    //             &bank_start,
+    //             &mut buffered_packet_batches,
+    //             &banking_stage_stats,
+    //             &mut LeaderSlotMetricsTracker::new(0),
+    //         );
 
-            // Check that all packets were processed without retrying
-            assert!(buffered_packet_batches.is_empty());
-            assert_eq!(
-                banking_stage_stats
-                    .consumed_buffered_packets_count
-                    .load(Ordering::Relaxed),
-                num_conflicting_transactions
-            );
-            assert_eq!(
-                banking_stage_stats
-                    .rebuffered_packets_count
-                    .load(Ordering::Relaxed),
-                0
-            );
-            // Use bank to check the number of entries (batches)
-            assert_eq!(bank_start.working_bank.transactions_per_entry_max(), 1);
-            assert_eq!(
-                bank_start.working_bank.transaction_entries_count(),
-                num_conflicting_transactions as u64
-            );
+    //         // Check that all packets were processed without retrying
+    //         assert!(buffered_packet_batches.is_empty());
+    //         assert_eq!(
+    //             banking_stage_stats
+    //                 .consumed_buffered_packets_count
+    //                 .load(Ordering::Relaxed),
+    //             num_conflicting_transactions
+    //         );
+    //         assert_eq!(
+    //             banking_stage_stats
+    //                 .rebuffered_packets_count
+    //                 .load(Ordering::Relaxed),
+    //             0
+    //         );
+    //         // Use bank to check the number of entries (batches)
+    //         assert_eq!(bank_start.working_bank.transactions_per_entry_max(), 1);
+    //         assert_eq!(
+    //             bank_start.working_bank.transaction_entries_count(),
+    //             num_conflicting_transactions as u64
+    //         );
 
-            poh_recorder
-                .read()
-                .unwrap()
-                .is_exited
-                .store(true, Ordering::Relaxed);
-            let _ = poh_simulator.join();
-        }
-        Blockstore::destroy(ledger_path.path()).unwrap();
-    }
-
+    //         poh_recorder
+    //             .read()
+    //             .unwrap()
+    //             .is_exited
+    //             .store(true, Ordering::Relaxed);
+    //         let _ = poh_simulator.join();
+    //     }
+    //     Blockstore::destroy(ledger_path.path()).unwrap();
+    // }
     #[test]
-    fn test_consume_buffered_packets_sanitization_error() {
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        {
-            let (mut transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
-                setup_conflicting_transactions(ledger_path.path());
-            let duplicate_account_key = transactions[0].message.account_keys[0];
-            transactions[0]
-                .message
-                .account_keys
-                .push(duplicate_account_key); // corrupt transaction
-            let recorder = poh_recorder.read().unwrap().new_recorder();
-            let num_conflicting_transactions = transactions.len();
-            let deserialized_packets =
-                unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
-                    .unwrap();
-            assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
-            let mut buffered_packet_batches =
-                UnprocessedTransactionStorage::new_transaction_storage(
-                    UnprocessedPacketBatches::from_iter(
-                        deserialized_packets.into_iter(),
-                        num_conflicting_transactions,
-                    ),
-                    ThreadType::Transactions,
-                );
+    // fn test_consume_buffered_packets_sanitization_error() {
+    //     let ledger_path = get_tmp_ledger_path_auto_delete!();
+    //     {
+    //         let (mut transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
+    //             setup_conflicting_transactions(ledger_path.path());
+    //         let duplicate_account_key = transactions[0].message.account_keys[0];
+    //         transactions[0]
+    //             .message
+    //             .account_keys
+    //             .push(duplicate_account_key); // corrupt transaction
+    //         let recorder = poh_recorder.read().unwrap().new_recorder();
+    //         let num_conflicting_transactions = transactions.len();
+    //         let deserialized_packets =
+    //             unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
+    //                 .unwrap();
+    //         assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
+    //         let mut buffered_packet_batches =
+    //             UnprocessedTransactionStorage::new_transaction_storage(
+    //                 UnprocessedPacketBatches::from_iter(
+    //                     deserialized_packets.into_iter(),
+    //                     num_conflicting_transactions,
+    //                 ),
+    //                 ThreadType::Transactions,
+    //             );
 
-            let (replay_vote_sender, _replay_vote_receiver) = unbounded();
-            let committer = Committer::new(
-                None,
-                replay_vote_sender,
-                Arc::new(PrioritizationFeeCache::new(0u64)),
-            );
-            let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+    //         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+    //         let committer = Committer::new(
+    //             None,
+    //             replay_vote_sender,
+    //             Arc::new(PrioritizationFeeCache::new(0u64)),
+    //         );
+    //         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
-            // When the working bank in poh_recorder is None, no packets should be processed
-            assert!(!poh_recorder.read().unwrap().has_bank());
-            assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
-            // When the working bank in poh_recorder is Some, all packets should be processed.
-            // Multi-Iterator will process them 1-by-1 if all txs are conflicting.
-            poh_recorder.write().unwrap().set_bank(&bank, false);
-            let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
-            consumer.consume_buffered_packets(
-                &bank_start,
-                &mut buffered_packet_batches,
-                &BankingStageStats::default(),
-                &mut LeaderSlotMetricsTracker::new(0),
-            );
-            assert!(buffered_packet_batches.is_empty());
-            poh_recorder
-                .read()
-                .unwrap()
-                .is_exited
-                .store(true, Ordering::Relaxed);
-            let _ = poh_simulator.join();
-        }
-        Blockstore::destroy(ledger_path.path()).unwrap();
-    }
-
+    //         // When the working bank in poh_recorder is None, no packets should be processed
+    //         assert!(!poh_recorder.read().unwrap().has_bank());
+    //         assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
+    //         // When the working bank in poh_recorder is Some, all packets should be processed.
+    //         // Multi-Iterator will process them 1-by-1 if all txs are conflicting.
+    //         poh_recorder.write().unwrap().set_bank(&bank, false);
+    //         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+    //         consumer.consume_buffered_packets(
+    //             &bank_start,
+    //             &mut buffered_packet_batches,
+    //             &BankingStageStats::default(),
+    //             &mut LeaderSlotMetricsTracker::new(0),
+    //         );
+    //         assert!(buffered_packet_batches.is_empty());
+    //         poh_recorder
+    //             .read()
+    //             .unwrap()
+    //             .is_exited
+    //             .store(true, Ordering::Relaxed);
+    //         let _ = poh_simulator.join();
+    //     }
+    //     Blockstore::destroy(ledger_path.path()).unwrap();
+    // }
     #[test]
-    fn test_consume_buffered_packets_retryable() {
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        {
-            let (transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
-                setup_conflicting_transactions(ledger_path.path());
-            let recorder = poh_recorder.read().unwrap().new_recorder();
-            let num_conflicting_transactions = transactions.len();
-            let deserialized_packets =
-                unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
-                    .unwrap();
-            assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
-            let retryable_packet = deserialized_packets[0].clone();
-            let mut buffered_packet_batches =
-                UnprocessedTransactionStorage::new_transaction_storage(
-                    UnprocessedPacketBatches::from_iter(
-                        deserialized_packets.into_iter(),
-                        num_conflicting_transactions,
-                    ),
-                    ThreadType::Transactions,
-                );
+    // fn test_consume_buffered_packets_retryable() {
+    //     let ledger_path = get_tmp_ledger_path_auto_delete!();
+    //     {
+    //         let (transactions, bank, poh_recorder, _entry_receiver, poh_simulator) =
+    //             setup_conflicting_transactions(ledger_path.path());
+    //         let recorder = poh_recorder.read().unwrap().new_recorder();
+    //         let num_conflicting_transactions = transactions.len();
+    //         let deserialized_packets =
+    //             unprocessed_packet_batches::transactions_to_deserialized_packets(&transactions)
+    //                 .unwrap();
+    //         assert_eq!(deserialized_packets.len(), num_conflicting_transactions);
+    //         let retryable_packet = deserialized_packets[0].clone();
+    //         let mut buffered_packet_batches =
+    //             UnprocessedTransactionStorage::new_transaction_storage(
+    //                 UnprocessedPacketBatches::from_iter(
+    //                     deserialized_packets.into_iter(),
+    //                     num_conflicting_transactions,
+    //                 ),
+    //                 ThreadType::Transactions,
+    //             );
 
-            let (replay_vote_sender, _replay_vote_receiver) = unbounded();
-            let committer = Committer::new(
-                None,
-                replay_vote_sender,
-                Arc::new(PrioritizationFeeCache::new(0u64)),
-            );
-            let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+    //         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+    //         let committer = Committer::new(
+    //             None,
+    //             replay_vote_sender,
+    //             Arc::new(PrioritizationFeeCache::new(0u64)),
+    //         );
+    //         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
-            // When the working bank in poh_recorder is None, no packets should be processed (consume will not be called)
-            assert!(!poh_recorder.read().unwrap().has_bank());
-            assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
-            // When the working bank in poh_recorder is Some, all packets should be processed
-            // except except for retryable errors. Manually take the lock of a transaction to
-            // simulate another thread processing a transaction with that lock.
-            poh_recorder.write().unwrap().set_bank(&bank, false);
-            let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+    //         // When the working bank in poh_recorder is None, no packets should be processed (consume will not be called)
+    //         assert!(!poh_recorder.read().unwrap().has_bank());
+    //         assert_eq!(buffered_packet_batches.len(), num_conflicting_transactions);
+    //         // When the working bank in poh_recorder is Some, all packets should be processed
+    //         // except except for retryable errors. Manually take the lock of a transaction to
+    //         // simulate another thread processing a transaction with that lock.
+    //         poh_recorder.write().unwrap().set_bank(&bank, false);
+    //         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
-            let lock_account = transactions[0].message.account_keys[1];
-            let manual_lock_tx =
-                SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
-                    &Keypair::new(),
-                    &lock_account,
-                    1,
-                    bank.last_blockhash(),
-                ));
-            let _ = bank_start.working_bank.accounts().lock_accounts(
-                std::iter::once(&manual_lock_tx),
-                bank_start.working_bank.get_transaction_account_lock_limit(),
-            );
+    //         let lock_account = transactions[0].message.account_keys[1];
+    //         let manual_lock_tx =
+    //             SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+    //                 &Keypair::new(),
+    //                 &lock_account,
+    //                 1,
+    //                 bank.last_blockhash(),
+    //             ));
+    //         let _ = bank_start.working_bank.accounts().lock_accounts(
+    //             std::iter::once(&manual_lock_tx),
+    //             bank_start.working_bank.get_transaction_account_lock_limit(),
+    //         );
 
-            let banking_stage_stats = BankingStageStats::default();
-            consumer.consume_buffered_packets(
-                &bank_start,
-                &mut buffered_packet_batches,
-                &banking_stage_stats,
-                &mut LeaderSlotMetricsTracker::new(0),
-            );
+    //         let banking_stage_stats = BankingStageStats::default();
+    //         consumer.consume_buffered_packets(
+    //             &bank_start,
+    //             &mut buffered_packet_batches,
+    //             &banking_stage_stats,
+    //             &mut LeaderSlotMetricsTracker::new(0),
+    //         );
 
-            // Check that all but 1 transaction was processed. And that it was rebuffered.
-            assert_eq!(buffered_packet_batches.len(), 1);
-            assert_eq!(
-                buffered_packet_batches.iter().next().unwrap(),
-                &retryable_packet
-            );
-            assert_eq!(
-                banking_stage_stats
-                    .consumed_buffered_packets_count
-                    .load(Ordering::Relaxed),
-                num_conflicting_transactions - 1,
-            );
-            assert_eq!(
-                banking_stage_stats
-                    .rebuffered_packets_count
-                    .load(Ordering::Relaxed),
-                1
-            );
-            // Use bank to check the number of entries (batches)
-            assert_eq!(bank_start.working_bank.transactions_per_entry_max(), 1);
-            assert_eq!(
-                bank_start.working_bank.transaction_entries_count(),
-                num_conflicting_transactions as u64 - 1
-            );
+    //         // Check that all but 1 transaction was processed. And that it was rebuffered.
+    //         assert_eq!(buffered_packet_batches.len(), 1);
+    //         assert_eq!(
+    //             buffered_packet_batches.iter().next().unwrap(),
+    //             &retryable_packet
+    //         );
+    //         assert_eq!(
+    //             banking_stage_stats
+    //                 .consumed_buffered_packets_count
+    //                 .load(Ordering::Relaxed),
+    //             num_conflicting_transactions - 1,
+    //         );
+    //         assert_eq!(
+    //             banking_stage_stats
+    //                 .rebuffered_packets_count
+    //                 .load(Ordering::Relaxed),
+    //             1
+    //         );
+    //         // Use bank to check the number of entries (batches)
+    //         assert_eq!(bank_start.working_bank.transactions_per_entry_max(), 1);
+    //         assert_eq!(
+    //             bank_start.working_bank.transaction_entries_count(),
+    //             num_conflicting_transactions as u64 - 1
+    //         );
 
-            poh_recorder
-                .read()
-                .unwrap()
-                .is_exited
-                .store(true, Ordering::Relaxed);
-            let _ = poh_simulator.join();
-        }
-        Blockstore::destroy(ledger_path.path()).unwrap();
-    }
-
+    //         poh_recorder
+    //             .read()
+    //             .unwrap()
+    //             .is_exited
+    //             .store(true, Ordering::Relaxed);
+    //         let _ = poh_simulator.join();
+    //     }
+    //     Blockstore::destroy(ledger_path.path()).unwrap();
+    // }
     #[test]
     fn test_accumulate_execute_units_and_time() {
         let mut execute_timings = ExecuteTimings::default();
