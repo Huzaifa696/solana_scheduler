@@ -1,0 +1,9 @@
+cat logs | grep tpu-verifier | awk '{print $33}' | sed 's/i//g'  | awk -F= '{print $2}' > output.csv
+
+for i in {1..10}; do echo -e "\a"; sleep 0.5; done
+
+# consume_buffered_packets_elapsed	consumed_buffered_packets_count	id	recieved packets    receive_and_buffer_packets_elapsed
+cat logs | grep banking_stage-loop-stats | awk '{print $17","$14","$7","$8","$18}' | sed 's/i//g' | awk -F'[=,]' '{print $2,$4,$6,$8,$10}' OFS=',' > output.csv
+
+# time per thread	loop counter per thread	id
+cat logs | grep "banking loop" | awk '{print $8,$10,$12}' > output.csv

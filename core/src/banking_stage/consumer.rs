@@ -156,6 +156,10 @@ impl Consumer {
         if sch_packet.clone().is_err() {
             return None;
         }
+        *consumed_buffered_packets_count += 1;
+        banking_stage_stats
+            .receive_and_buffer_packets_count
+            .fetch_add(1, Ordering::Relaxed);
         let sch_packet = sch_packet.clone().unwrap();
         let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self

@@ -432,8 +432,8 @@ impl Scheduler {
                             sch_stats.working_bank/sch_stats.loop_counter, 
                             sch_stats.retry_and_garbage_collection/sch_stats.loop_counter, 
                             sch_stats.batch_processing/sch_stats.loop_counter, 
-                            sch_stats.buffering_time,
-                            sch_stats.un_buffering_time,
+                            sch_stats.buffering_time/sch_stats.loop_counter,
+                            sch_stats.un_buffering_time/sch_stats.loop_counter,
                             sch_stats.tx_counter,
                             sch_stats.tx_recv_counter,
                             sch_stats.not_leader_counter,
@@ -488,9 +488,11 @@ impl Scheduler {
         while !prioritized_buffer.is_empty() {
             if let Some(sch_packet) = prioritized_buffer.pop_max() {
                 let target_thread =
-                    Scheduler::get_thread_number(&sch_packet, acct_lookup_table, &channels)
-                        as usize;
-
+                    // Scheduler::get_thread_number(&sch_packet, acct_lookup_table, &channels)
+                    //     as usize;
+                    // for testing
+                    Scheduler::round_robin(BANKING_THREADS);
+                info!("target_thread: {}", target_thread);
                 sch_stats.tx_counter += 1;
                 let _sending_result = channels
                     .get(target_thread as usize)
@@ -503,6 +505,20 @@ impl Scheduler {
                 return;
             }
         }
+    }
+
+    fn round_robin(input: usize) -> usize {
+        // static variable to keep track of last returned thread number
+        static mut LAST_THREAD_NUMBER: usize = 0;
+
+        // get the current thread number and update the static variable
+        let current_thread_number = unsafe {
+            let thread_number = LAST_THREAD_NUMBER;
+            LAST_THREAD_NUMBER = (LAST_THREAD_NUMBER + 1) % input;
+            thread_number
+        };
+
+        current_thread_number
     }
 
     fn fill_buffer(
@@ -621,12 +637,9 @@ impl Scheduler {
         let recv_timeout = Scheduler::get_receive_timeout(prioritized_buffer);
 
         let (non_vote_packets, mut packet_batches) =
-            Scheduler::receive_until(non_vote_receiver, recv_timeout, capacity).unwrap();
+            Scheduler::receive_until(non_vote_receiver, recv_timeout, capacity);
         let (vote_packets, vote_packet_batches) =
-            Scheduler::receive_until(tpu_vote_receiver, recv_timeout, capacity).unwrap();
-
-        // let mut packet_batches = Scheduler::get_packet_batches(&non_vote_receiver);
-        // let vote_packet_batches = Scheduler::get_packet_batches(&tpu_vote_receiver);
+            Scheduler::receive_until(tpu_vote_receiver, recv_timeout, capacity);
 
         packet_batches.extend(vote_packet_batches);
         (non_vote_packets + vote_packets, packet_batches)
@@ -645,19 +658,27 @@ impl Scheduler {
         receiver: &Receiver<Vec<PacketBatch>>,
         recv_timeout: Duration,
         packet_count_upperbound: usize,
-    ) -> Result<(usize, Vec<PacketBatch>), RecvTimeoutError> {
+    ) -> (usize, Vec<PacketBatch>) {
         let start = Instant::now();
 
-        let mut packet_batches = receiver.recv_timeout(recv_timeout)?;
+        let mut packet_batches = match receiver.recv_timeout(recv_timeout) {
+            Ok(batches) => batches,
+            Err(_) => {
+                let empty_vec: Vec<PacketBatch> = Vec::new();
+                return (0, empty_vec);
+            }
+        };
+
         let mut num_packets_received = packet_batches
             .iter()
             .map(|batch| batch.len())
             .sum::<usize>();
 
-        while let Ok(message) = receiver.try_recv() {
-            let new_batches = message.clone();
+        // let num_packets_received = 0;
+        while let Ok(new_batches) = receiver.try_recv() {
             trace!("got more packet batches in packet deserializer");
-            num_packets_received += new_batches.iter().map(|batch| batch.len()).sum::<usize>();
+            let new_packet_count = new_batches.iter().map(|batch| batch.len()).sum::<usize>();
+            num_packets_received += new_packet_count;
             packet_batches.extend(new_batches);
 
             if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
@@ -665,40 +686,8 @@ impl Scheduler {
             }
         }
 
-        Ok((num_packets_received, packet_batches))
+        (num_packets_received, packet_batches)
     }
-
-    // fn receive_until(
-    //     receiver: &Receiver<Vec<PacketBatch>>,
-    //     recv_timeout: Duration,
-    //     packet_count_upperbound: usize,
-    // ) -> Result<(usize, Vec<Vec<PacketBatch>>), RecvTimeoutError> {
-    //     let start = Instant::now();
-
-    //     let message = receiver.recv_timeout(recv_timeout)?;
-    //     let packet_batches = message.clone();
-    //     let mut num_packets_received = packet_batches
-    //         .iter()
-    //         .map(|batch| batch.len())
-    //         .sum::<usize>();
-    //     let mut messages = vec![message];
-
-    //     while let Ok(message) = receiver.try_recv() {
-    //         let packet_batches = message;
-    //         trace!("got more packet batches in packet deserializer");
-    //         num_packets_received += packet_batches
-    //             .iter()
-    //             .map(|batch| batch.len())
-    //             .sum::<usize>();
-    //         messages.push(message.clone());
-
-    //         if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
-    //             break;
-    //         }
-    //     }
-
-    //     Ok((num_packets_received, messages))
-    // }
 
     fn find_least_loaded_thread(channels: &Buffers) -> usize {
         let mut min = usize::MAX;
@@ -721,34 +710,41 @@ impl Scheduler {
         let mut prev_thread_selection = 1000; // random number to detect initial value
         for acct in sch_packet.accts.iter() {
             let mut single_thread: bool = false;
+            let entry = lookup_table.acct_lookup.get(acct);
 
-            for (i, x) in lookup_table
-                .acct_lookup
-                .get(acct)
-                .unwrap()
-                .iter()
-                .enumerate()
-            {
-                if *x == 0 {
-                    continue;
-                } else if single_thread == false {
-                    single_thread = true;
-                    if prev_thread_selection == 1000 {
-                        prev_thread_selection = i;
-                    } else if prev_thread_selection == i {
+            if entry.is_some() {
+                for (i, x) in entry.unwrap().iter().enumerate() {
+                    if *x == 0 {
+                        continue;
+                    } else if single_thread == false {
+                        single_thread = true;
+                        if prev_thread_selection == 1000 {
+                            prev_thread_selection = i;
+                        } else if prev_thread_selection == i {
+                        } else {
+                            target_thread = Self::find_least_loaded_thread(channels);
+                            Self::update_lookup_table(
+                                lookup_table,
+                                target_thread as u64,
+                                sch_packet,
+                            );
+                            return target_thread as u64;
+                        }
+
+                        continue;
                     } else {
                         target_thread = Self::find_least_loaded_thread(channels);
                         Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
                         return target_thread as u64;
                     }
-
-                    continue;
-                } else {
-                    target_thread = Self::find_least_loaded_thread(channels);
-                    Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
-                    return target_thread as u64;
                 }
+            } else {
+                continue;
             }
+        }
+        // in case the acct is not found in any thread
+        if prev_thread_selection == 1000 {
+            prev_thread_selection = Self::find_least_loaded_thread(channels);
         }
         target_thread = prev_thread_selection;
         Self::update_lookup_table(lookup_table, target_thread as u64, sch_packet);
@@ -958,7 +954,7 @@ impl BankingStage {
         // Keeps track of extraneous vote transactions for the vote threads
         // let _latest_unprocessed_votes = Arc::new(LatestUnprocessedVotes::new());
         // Many banks that process transactions in parallel.
-        let bank_thread_hdls: Vec<JoinHandle<()>> = (0..num_threads)
+        let bank_thread_hdls: Vec<JoinHandle<()>> = (0..BANKING_THREADS)
             .map(|id| {
                 // let x = &receivers;
                 let packet_receiver = match id {
@@ -987,25 +983,23 @@ impl BankingStage {
                 let consumer = Consumer::new(
                     committer,
                     poh_recorder.read().unwrap().new_recorder(),
-                    QosService::new(id),
+                    QosService::new(id as u32),
                     log_messages_bytes_limit,
                 );
 
                 Builder::new()
                     .name(format!("solBanknStgTx{id:02}"))
                     .spawn(move || {
-                        let mut banking_stage_stats = BankingStageStats::new(id);
+                        let mut banking_stage_stats = BankingStageStats::new(id as u32);
 
-                        let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id);
+                        let mut slot_metrics_tracker = LeaderSlotMetricsTracker::new(id as u32);
                         let mut last_metrics_update = Instant::now();
 
                         let mut accumalative_time = 0;
                         let mut counter = 0;
                         loop {
                             let start = Instant::now();
-                            if packet_receiver.is_empty()
-                                || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
-                            {
+                            if !packet_receiver.is_empty() {
                                 let (_, process_buffered_packets_time) = measure!(
                                     Self::process_buffered_packets(
                                         &packet_receiver,
@@ -1030,8 +1024,8 @@ impl BankingStage {
                             counter += 1;
                             if accumalative_time > 1000000 {
                                 info!(
-                                    "banking loop time {} and count {}",
-                                    accumalative_time, counter
+                                    "banking loop time {}, count {}, id {}",
+                                    accumalative_time, counter, id
                                 );
                                 accumalative_time = 0;
                                 counter = 0;

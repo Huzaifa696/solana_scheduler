@@ -33,7 +33,7 @@ use {
 const MAX_DEDUP_BATCH: usize = 165_000;
 
 // 50ms/(25us/packet) = 2000 packets
-const MAX_SIGVERIFY_BATCH: usize = 2_000;
+const MAX_SIGVERIFY_BATCH: usize = 100_000;
 
 // Packet batch shrinker will reorganize packets into compacted batches if 10%
 // or more of the packets in a group of packet batches have been discarded.
