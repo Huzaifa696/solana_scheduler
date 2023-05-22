@@ -1,5 +1,6 @@
 use crate::banking_stage::Sender;
 use crate::tpu::ControlObj;
+use std::time::Duration;
 use {
     super::{
         committer::{CommitTransactionDetails, Committer},
@@ -40,6 +41,7 @@ use {
 
 use crate::banking_stage::SchPacket;
 use crossbeam_channel::Receiver;
+use lazy_static::__Deref;
 
 pub const MAX_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
 
@@ -136,6 +138,39 @@ impl Consumer {
             .fetch_add(consumed_buffered_packets_count, Ordering::Relaxed);
     }
 
+    // fn receive_until(
+    //     receiver: &Receiver<SchPacket>,
+    //     recv_timeout: Duration,
+    //     packet_count_upperbound: usize,
+    // ) -> (usize, Vec<SchPacket>) {
+    //     let start = Instant::now();
+    //     let mut num_packets_received;
+
+    //     let mut packet = match receiver.recv_timeout(recv_timeout) {
+    //         Ok(batches) => batches,
+    //         Err(_) => {
+    //             let empty_vec: Vec<SchPacket> = Vec::new();
+    //             return (0, empty_vec);
+    //         }
+    //     };
+
+    //     let mut packets = vec![packet];
+    //     num_packets_received += 1;
+
+    //     // let num_packets_received = 0;
+    //     while let Ok(new_batches) = receiver.try_recv() {
+    //         trace!("got more packet batches in packet deserializer");
+    //         packets.push(new_batches);
+    //         num_packets_received += 1;
+
+    //         if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
+    //             break;
+    //         }
+    //     }
+
+    //     (num_packets_received, packets)
+    // }
+
     fn do_process_packets(
         &self,
         packet_receiver: &Receiver<SchPacket>,
@@ -146,26 +181,31 @@ impl Consumer {
         retry_sender: &Sender<ControlObj>,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) -> Option<Vec<usize>> {
-        // if payload.reached_end_of_slot {
-        //     return None;
-        // }
 
-        // let packets_to_process_len = packet_receiver.len();
-
+        // choices for duration and upper bound are arbitrary
+        // let (recv_count, sch_packets) = Consumer::receive_until(packet_receiver, Duration::from_micros(10), 64);
         let sch_packet = &packet_receiver.try_recv();
         if sch_packet.clone().is_err() {
             return None;
         }
+        // *consumed_buffered_packets_count += recv_count;
+        // banking_stage_stats
+        //     .receive_and_buffer_packets_count
+        //     .fetch_add(recv_count, Ordering::Relaxed);
         *consumed_buffered_packets_count += 1;
         banking_stage_stats
             .receive_and_buffer_packets_count
             .fetch_add(1, Ordering::Relaxed);
         let sch_packet = sch_packet.clone().unwrap();
         let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
+
+        // let tx_array: Vec<SanitizedTransaction> = sch_packets.iter().map(|schpackt| schpackt.transaction.clone()).collect();
+
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self
             .process_packets_transactions(
                 &bank_start.working_bank,
                 &bank_start.bank_creation_time,
+                // &tx_array[..],
                 &uni_tx_array,
                 banking_stage_stats,
                 retry_sender,

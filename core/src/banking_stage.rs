@@ -308,9 +308,9 @@ pub struct Scheduler {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SchPacket {
-    transaction: SanitizedTransaction,
-    priority: u64,
-    accts: Vec<Pubkey>,
+    pub transaction: SanitizedTransaction,
+    pub priority: u64,
+    pub accts: Vec<Pubkey>,
 }
 
 impl PartialOrd for SchPacket {
