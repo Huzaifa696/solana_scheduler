@@ -1,3 +1,4 @@
+use crate::banking_stage::consumer::CommitTransactionDetails::NotCommitted;
 use crate::banking_stage::Sender;
 use crate::tpu::ControlObj;
 use std::time::Duration;
@@ -54,6 +55,7 @@ pub struct ProcessTransactionBatchOutput {
 }
 
 pub struct ExecuteAndCommitTransactionsOutput {
+    consumed_tx: usize,
     // Total number of transactions that were passed as candidates for execution
     transactions_attempted_execution_count: usize,
     // The number of transactions of that were executed. See description of in `ProcessTransactionsSummary`
@@ -70,6 +72,49 @@ pub struct ExecuteAndCommitTransactionsOutput {
     commit_transactions_result: Result<Vec<CommitTransactionDetails>, PohRecorderError>,
     execute_and_commit_timings: LeaderExecuteAndCommitTimings,
     error_counters: TransactionErrorMetrics,
+}
+
+impl ExecuteAndCommitTransactionsOutput {
+    pub fn append(&self, appended_stats: ExecuteAndCommitTransactionsOutput) -> Self {
+        // Self {
+        //     consumed_tx: self.consumed_tx + appended_stats.consumed_tx,
+        //     transactions_attempted_execution_count : self.transactions_attempted_execution_count + appended_stats.transactions_attempted_execution_count,
+        //     executed_transactions_count : self.executed_transactions_count + appended_stats.executed_transactions_count,
+        //     executed_with_successful_result_count : self.executed_with_successful_result_count + appended_stats.executed_with_successful_result_count,
+        //     retryable_transaction_indexes : Vec::default(),
+        //     commit_transactions_result : appended_stats.commit_transactions_result,
+        //     execute_and_commit_timings : LeaderExecuteAndCommitTimings::default(),
+        //     error_counters: TransactionErrorMetrics::default(),
+        // }
+
+        Self {
+            consumed_tx: self.consumed_tx + appended_stats.consumed_tx,
+            transactions_attempted_execution_count: self.transactions_attempted_execution_count
+                + appended_stats.transactions_attempted_execution_count,
+            executed_transactions_count: self.executed_transactions_count
+                + appended_stats.executed_transactions_count,
+            executed_with_successful_result_count: self.executed_with_successful_result_count
+                + appended_stats.executed_with_successful_result_count,
+            // dont care about the following variables
+            retryable_transaction_indexes: appended_stats.retryable_transaction_indexes,
+            commit_transactions_result: appended_stats.commit_transactions_result,
+            execute_and_commit_timings: appended_stats.execute_and_commit_timings,
+            error_counters: appended_stats.error_counters,
+        }
+    }
+
+    pub fn default() -> Self {
+        Self {
+            consumed_tx: 0,
+            transactions_attempted_execution_count: 0,
+            executed_transactions_count: 0,
+            executed_with_successful_result_count: 0,
+            retryable_transaction_indexes: Vec::default(),
+            commit_transactions_result: Result::Ok(vec![NotCommitted]),
+            execute_and_commit_timings: LeaderExecuteAndCommitTimings::default(),
+            error_counters: TransactionErrorMetrics::default(),
+        }
+    }
 }
 
 pub struct Consumer {
@@ -138,38 +183,37 @@ impl Consumer {
             .fetch_add(consumed_buffered_packets_count, Ordering::Relaxed);
     }
 
-    // fn receive_until(
-    //     receiver: &Receiver<SchPacket>,
-    //     recv_timeout: Duration,
-    //     packet_count_upperbound: usize,
-    // ) -> (usize, Vec<SchPacket>) {
-    //     let start = Instant::now();
-    //     let mut num_packets_received;
+    fn receive_until(
+        receiver: &Receiver<SchPacket>,
+        recv_timeout: Duration,
+        packet_count_upperbound: usize,
+    ) -> (usize, Vec<SchPacket>) {
+        let start = Instant::now();
+        let mut num_packets_received = 0;
 
-    //     let mut packet = match receiver.recv_timeout(recv_timeout) {
-    //         Ok(batches) => batches,
-    //         Err(_) => {
-    //             let empty_vec: Vec<SchPacket> = Vec::new();
-    //             return (0, empty_vec);
-    //         }
-    //     };
+        let packet = match receiver.recv_timeout(recv_timeout) {
+            Ok(batches) => batches,
+            Err(_) => {
+                let empty_vec: Vec<SchPacket> = Vec::new();
+                return (0, empty_vec);
+            }
+        };
 
-    //     let mut packets = vec![packet];
-    //     num_packets_received += 1;
+        let mut packets = vec![packet];
+        num_packets_received += 1;
 
-    //     // let num_packets_received = 0;
-    //     while let Ok(new_batches) = receiver.try_recv() {
-    //         trace!("got more packet batches in packet deserializer");
-    //         packets.push(new_batches);
-    //         num_packets_received += 1;
+        while let Ok(new_batches) = receiver.try_recv() {
+            trace!("got more packet batches in packet deserializer");
+            packets.push(new_batches);
+            num_packets_received += 1;
 
-    //         if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
-    //             break;
-    //         }
-    //     }
+            if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
+                break;
+            }
+        }
 
-    //     (num_packets_received, packets)
-    // }
+        (num_packets_received, packets)
+    }
 
     fn do_process_packets(
         &self,
@@ -181,36 +225,32 @@ impl Consumer {
         retry_sender: &Sender<ControlObj>,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) -> Option<Vec<usize>> {
-
         // choices for duration and upper bound are arbitrary
-        // let (recv_count, sch_packets) = Consumer::receive_until(packet_receiver, Duration::from_micros(10), 64);
-        let sch_packet = &packet_receiver.try_recv();
-        if sch_packet.clone().is_err() {
-            return None;
-        }
+        let (recv_count, sch_packets) =
+            Consumer::receive_until(packet_receiver, Duration::from_micros(10), 64*46);
+
         // *consumed_buffered_packets_count += recv_count;
-        // banking_stage_stats
-        //     .receive_and_buffer_packets_count
-        //     .fetch_add(recv_count, Ordering::Relaxed);
-        *consumed_buffered_packets_count += 1;
         banking_stage_stats
             .receive_and_buffer_packets_count
-            .fetch_add(1, Ordering::Relaxed);
-        let sch_packet = sch_packet.clone().unwrap();
-        let uni_tx_array: [SanitizedTransaction; 1] = [sch_packet.transaction.clone()];
+            .fetch_add(recv_count, Ordering::Relaxed);
 
-        // let tx_array: Vec<SanitizedTransaction> = sch_packets.iter().map(|schpackt| schpackt.transaction.clone()).collect();
+        let tx_array: Vec<SanitizedTransaction> = sch_packets
+            .iter()
+            .map(|schpackt| schpackt.transaction.clone())
+            .collect();
 
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self
             .process_packets_transactions(
                 &bank_start.working_bank,
                 &bank_start.bank_creation_time,
-                // &tx_array[..],
-                &uni_tx_array,
+                &tx_array[..],
                 banking_stage_stats,
                 retry_sender,
                 slot_metrics_tracker,
             ));
+
+        *consumed_buffered_packets_count += process_transactions_summary.consumed_packets;
+
         slot_metrics_tracker
             .increment_process_packets_transactions_us(process_packets_transactions_us);
 
@@ -273,10 +313,15 @@ impl Consumer {
             .fetch_add(process_transactions_us, Ordering::Relaxed);
 
         let ProcessTransactionsSummary {
+            consumed_packets,
             ref retryable_transaction_indexes,
             ref error_counters,
             ..
         } = process_transactions_summary;
+
+        banking_stage_stats
+            .consumed_buffered_packets_count
+            .fetch_add(consumed_packets, Ordering::Relaxed);
 
         slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
         slot_metrics_tracker.accumulate_transaction_errors(error_counters);
@@ -396,36 +441,8 @@ impl Consumer {
             saturating_add_assign!(total_failed_commit_count, new_executed_transactions_count);
         }
 
-        // Add the retryable txs (transactions that errored in a way that warrants a retry)
-        // to the list of unprocessed txs.
-        // all_retryable_tx_indexes.extend_from_slice(&new_retryable_transaction_indexes);
-
-        // let should_bank_still_be_processing_txs =
-        //     Bank::should_bank_still_be_processing_txs(bank_creation_time, bank.ns_per_slot);
-        // match (
-        //     new_commit_transactions_result,
-        //     should_bank_still_be_processing_txs,
-        // ) {
-        //     (Err(PohRecorderError::MaxHeightReached), _) | (_, false) => {
-        //         info!(
-        //             "process transactions: max height reached slot: {} height: {}",
-        //             bank.slot(),
-        //             bank.tick_height()
-        //         );
-        //         // process_and_record_transactions has returned all retryable errors in
-        //         // transactions[chunk_start..chunk_end], so we just need to push the remaining
-        //         // transactions into the unprocessed queue.
-        //         all_retryable_tx_indexes.extend(chunk_end..transactions.len());
-        //         reached_max_poh_height = true;
-        //         break;
-        //     }
-        //     _ => (),
-        // }
-        // // Don't exit early on any other type of error, continue processing...
-        // chunk_start = chunk_end;
-        // }
-
         ProcessTransactionsSummary {
+            consumed_packets: execute_and_commit_transactions_output.consumed_tx,
             reached_max_poh_height,
             transactions_attempted_execution_count: total_transactions_attempted_execution_count,
             committed_transactions_count: total_committed_transactions_count,
@@ -454,28 +471,39 @@ impl Consumer {
             .qos_service
             .select_and_accumulate_transaction_costs(bank, txs));
 
-        // Only lock accounts for those transactions are selected for the block;
-        // Once accounts are locked, other threads cannot encode transactions that will modify the
-        // same account state
-        let (batch, lock_us) = measure_us!(
-            bank.prepare_sanitized_batch_with_results(txs, transactions_qos_results.iter())
-        );
+        let mut accumulative_execute_and_commit_transactions_output:  ExecuteAndCommitTransactionsOutput = ExecuteAndCommitTransactionsOutput::default();
+        let mut lock_us = 0;
+        let mut unlock_us = 0;
+        for tx in txs {
+            let uni_tx_array = vec![tx.clone()];
 
-        // retryable_txs includes AccountInUse, WouldExceedMaxBlockCostLimit
-        // WouldExceedMaxAccountCostLimit, WouldExceedMaxVoteCostLimit
-        // and WouldExceedMaxAccountDataCostLimit
-        let mut execute_and_commit_transactions_output =
-            self.execute_and_commit_transactions_locked(bank, &batch, id, retry_sender);
+            // Only lock accounts for those transactions are selected for the block;
+            // Once accounts are locked, other threads cannot encode transactions that will modify the
+            // same account state
+            let (batch, lock_us) = measure_us!(bank.prepare_sanitized_batch_with_results(
+                &uni_tx_array[..],
+                transactions_qos_results.iter()
+            ));
 
-        // Once the accounts are new transactions can enter the pipeline to process them
-        let (_, unlock_us) = measure_us!(drop(batch));
+            // retryable_txs includes AccountInUse, WouldExceedMaxBlockCostLimit
+            // WouldExceedMaxAccountCostLimit, WouldExceedMaxVoteCostLimit
+            // and WouldExceedMaxAccountDataCostLimit
+            let mut execute_and_commit_transactions_output =
+                self.execute_and_commit_transactions_locked(bank, &batch, id, retry_sender);
+
+            // Once the accounts are new transactions can enter the pipeline to process them
+            (_, unlock_us) = measure_us!(drop(batch));
+
+            accumulative_execute_and_commit_transactions_output
+                .append(execute_and_commit_transactions_output);
+        }
 
         let ExecuteAndCommitTransactionsOutput {
             ref mut retryable_transaction_indexes,
             ref execute_and_commit_timings,
             ref commit_transactions_result,
             ..
-        } = execute_and_commit_transactions_output;
+        } = accumulative_execute_and_commit_transactions_output;
 
         QosService::update_or_remove_transaction_costs(
             transaction_costs.iter(),
@@ -507,7 +535,8 @@ impl Consumer {
         ProcessTransactionBatchOutput {
             cost_model_throttled_transactions_count,
             cost_model_us,
-            execute_and_commit_transactions_output,
+            execute_and_commit_transactions_output:
+                accumulative_execute_and_commit_transactions_output,
         }
     }
 
@@ -556,6 +585,7 @@ impl Consumer {
                 .get(0)
                 .is_some()
             {
+                // retry
                 if *load_and_execute_transactions_output
                     .retryable_transaction_indexes
                     .get(0)
@@ -644,6 +674,7 @@ impl Consumer {
             // ));
 
             return ExecuteAndCommitTransactionsOutput {
+                consumed_tx: load_and_execute_transactions_output.consumed_packets,
                 transactions_attempted_execution_count,
                 executed_transactions_count,
                 executed_with_successful_result_count,
@@ -697,6 +728,7 @@ impl Consumer {
         );
 
         ExecuteAndCommitTransactionsOutput {
+            consumed_tx: load_and_execute_transactions_output.consumed_packets,
             transactions_attempted_execution_count,
             executed_transactions_count,
             executed_with_successful_result_count,

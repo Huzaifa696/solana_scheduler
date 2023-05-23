@@ -427,6 +427,7 @@ impl TransactionExecutionResult {
 }
 
 pub struct LoadAndExecuteTransactionsOutput {
+    pub consumed_packets: usize,
     pub loaded_transactions: Vec<TransactionLoadResult>,
     // Vector of results indicating whether a transaction was executed or could not
     // be executed. Note executed transactions can still have failed!
@@ -4549,9 +4550,11 @@ impl Bank {
             .collect();
 
         let mut retryable_transaction_indexes: Vec<usize> = Vec::new();
+        let mut consumed_tx = 0;
         if conflict.get(0).is_some() {
             if *conflict.get(0).unwrap() {
                 retryable_transaction_indexes.push(1);
+                consumed_tx += 1;
             }
         }
 
@@ -4794,6 +4797,7 @@ impl Bank {
             );
         }
         LoadAndExecuteTransactionsOutput {
+            consumed_packets: consumed_tx,
             loaded_transactions,
             execution_results,
             retryable_transaction_indexes,
