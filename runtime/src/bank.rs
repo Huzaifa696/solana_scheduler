@@ -4530,6 +4530,7 @@ impl Bank {
         debug!("processing transactions: {}", sanitized_txs.len());
         inc_new_counter_info!("bank-process_transactions", sanitized_txs.len());
         let mut error_counters = TransactionErrorMetrics::default();
+        let mut consumed_tx = 0;
 
         let conflict: Vec<bool> = batch
             .lock_results()
@@ -4545,16 +4546,18 @@ impl Bank {
                     | TransactionError::TooManyAccountLocks,
                 ) => Some(true),
                 Err(_) => None,
-                Ok(_) => None,
+                Ok(_) => {
+                    consumed_tx += 1;
+                    None
+                }
             })
             .collect();
 
         let mut retryable_transaction_indexes: Vec<usize> = Vec::new();
-        let mut consumed_tx = 0;
         if conflict.get(0).is_some() {
             if *conflict.get(0).unwrap() {
                 retryable_transaction_indexes.push(1);
-                consumed_tx += 1;
+                // consumed_tx += 1;
             }
         }
 

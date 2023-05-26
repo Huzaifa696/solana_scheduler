@@ -347,6 +347,7 @@ struct SchedulerStats {
     vote_counter: u64,
     empty_buffer: u64,
     buffered_packets: u64,
+    retry_counter: u64,
 }
 
 impl SchedulerStats {
@@ -367,6 +368,7 @@ impl SchedulerStats {
             vote_counter: 0,
             empty_buffer: 0,
             buffered_packets: 0,
+            retry_counter: 0,
         }
     }
 }
@@ -399,21 +401,23 @@ impl Scheduler {
                     
                     // bank required for deserialization of packet into transaction
                     let (working_bank, working_bank_time_us) = measure_us!(Scheduler::is_bank_available(&poh_recorder));
-                    sch_stats.working_bank += working_bank_time_us;
                     let bank = match working_bank {
                         Some(bank) => bank,
                         None => {sch_stats.not_leader_counter += 1; continue;},
                     };                 
-                    
+                    sch_stats.working_bank += working_bank_time_us;
+
                     // packet batches from sigverify stage
                     let ((no_of_packets, packet_batches), packet_reception_time) = measure_us!(Scheduler::receive_packet_batches(&packet_receiver, &vote_packet_receiver, &mut prioritized_buffer));
+                    if no_of_packets == 0 {
+                        sch_stats.working_bank -= working_bank_time_us;
+                        continue;
+                    }
                     sch_stats.packet_reception += packet_reception_time;
-                    // for batch in packet_batches.iter() {
-                        sch_stats.tx_recv_counter += no_of_packets as u64;
-                    // }
+                    sch_stats.tx_recv_counter += no_of_packets as u64;
 
                     // garbage collection 
-                    let (_, retry_and_garbage_collection_time) = measure_us!(Scheduler::retry_and_garbage_collection(&retry_receiver, &mut acct_lookup_table, &mut prioritized_buffer));
+                    let (_, retry_and_garbage_collection_time) = measure_us!(Scheduler::retry_and_garbage_collection(&retry_receiver, &mut acct_lookup_table, &mut prioritized_buffer, &mut sch_stats));
                     sch_stats.retry_and_garbage_collection += retry_and_garbage_collection_time;
 
                     // batch processing
@@ -425,7 +429,7 @@ impl Scheduler {
 
                     if sch_stats.last_logged > ONE_SEC {
                         info!(
-                            "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, buffering_time {}, un_buffering_time {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}, buffered_packets {}",
+                            "scheduler loop time {}, count {}, packet_reception {}, working_bank {}, retry_and_garbage_collection {}, batch_processing {}, buffering_time {}, un_buffering_time {}, tx_counter {}, tx_recv_counter {}, not_leader_counter {}, vote_counter {}, empty_buffer {}, buffered_packets {}, retry_counter {}",
                             sch_stats.last_logged, 
                             sch_stats.loop_counter, 
                             sch_stats.packet_reception/sch_stats.loop_counter, 
@@ -440,6 +444,7 @@ impl Scheduler {
                             sch_stats.vote_counter,
                             sch_stats.empty_buffer,
                             sch_stats.buffered_packets,
+                            sch_stats.retry_counter,
                         );
                         sch_stats = SchedulerStats::default();
                     }
@@ -588,6 +593,7 @@ impl Scheduler {
         retry_receiver: &Receiver<ControlObj>,
         acct_lookup_table: &mut LookupTable,
         prioritized_buffer: &mut MinMaxHeap<SchPacket>,
+        sch_stats: &mut SchedulerStats,
     ) {
         'retry_loop: while !retry_receiver.is_empty() {
             let control_obj = match retry_receiver.try_recv() {
@@ -615,6 +621,7 @@ impl Scheduler {
                     priority: 0,
                     accts,
                 });
+                sch_stats.retry_counter += 1;
             }
         }
     }
@@ -973,13 +980,7 @@ impl BankingStage {
                     prioritization_fee_cache.clone(),
                 );
                 let decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
-                // let forwarder = Forwarder::new(
-                //     poh_recorder.clone(),
-                //     bank_forks.clone(),
-                //     cluster_info.clone(),
-                //     connection_cache.clone(),
-                //     data_budget.clone(),
-                // );
+
                 let consumer = Consumer::new(
                     committer,
                     poh_recorder.read().unwrap().new_recorder(),
@@ -1030,7 +1031,6 @@ impl BankingStage {
                                 accumalative_time = 0;
                                 counter = 0;
                             }
-                            // banking_stage_stats.report(1000);
                         }
                     })
                     .unwrap()

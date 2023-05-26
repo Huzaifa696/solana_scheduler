@@ -150,7 +150,7 @@ impl Consumer {
         let mut rebuffered_packet_count = 0;
         let mut consumed_buffered_packets_count = 0;
         let mut proc_start = Measure::start("consume_buffered_process");
-        let num_packets_to_process = packet_receiver.len();
+        // let num_packets_to_process = packet_receiver.len();
 
         self.do_process_packets(
             packet_receiver,
@@ -163,14 +163,14 @@ impl Consumer {
         );
 
         proc_start.stop();
-        debug!(
-            "@{:?} done processing buffered batches: {} time: {:?}ms tx count: {} tx/s: {}",
-            timestamp(),
-            num_packets_to_process,
-            proc_start.as_ms(),
-            consumed_buffered_packets_count,
-            (consumed_buffered_packets_count as f32) / (proc_start.as_s())
-        );
+        // debug!(
+        //     "@{:?} done processing buffered batches: {} time: {:?}ms tx count: {} tx/s: {}",
+        //     timestamp(),
+        //     num_packets_to_process,
+        //     proc_start.as_ms(),
+        //     consumed_buffered_packets_count,
+        //     (consumed_buffered_packets_count as f32) / (proc_start.as_s())
+        // );
 
         banking_stage_stats
             .consume_buffered_packets_elapsed
@@ -187,14 +187,14 @@ impl Consumer {
         receiver: &Receiver<SchPacket>,
         recv_timeout: Duration,
         packet_count_upperbound: usize,
-    ) -> (usize, Vec<SchPacket>) {
+    ) -> (usize, Vec<SanitizedTransaction>) {
         let start = Instant::now();
         let mut num_packets_received = 0;
 
         let packet = match receiver.recv_timeout(recv_timeout) {
-            Ok(batches) => batches,
+            Ok(batches) => batches.transaction,
             Err(_) => {
-                let empty_vec: Vec<SchPacket> = Vec::new();
+                let empty_vec: Vec<SanitizedTransaction> = Vec::new();
                 return (0, empty_vec);
             }
         };
@@ -204,7 +204,7 @@ impl Consumer {
 
         while let Ok(new_batches) = receiver.try_recv() {
             trace!("got more packet batches in packet deserializer");
-            packets.push(new_batches);
+            packets.push(new_batches.transaction);
             num_packets_received += 1;
 
             if start.elapsed() >= recv_timeout || num_packets_received >= packet_count_upperbound {
@@ -226,30 +226,34 @@ impl Consumer {
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) -> Option<Vec<usize>> {
         // choices for duration and upper bound are arbitrary
-        let (recv_count, sch_packets) =
-            Consumer::receive_until(packet_receiver, Duration::from_micros(10), 64*46);
+        let ((recv_count, sch_packets),recv_time) =
+            measure_us!(Consumer::receive_until(packet_receiver, Duration::from_micros(1000), 64 * 46));
+
+        if recv_count == 0 {
+            return None;
+        }
 
         // *consumed_buffered_packets_count += recv_count;
         banking_stage_stats
             .receive_and_buffer_packets_count
             .fetch_add(recv_count, Ordering::Relaxed);
 
-        let tx_array: Vec<SanitizedTransaction> = sch_packets
-            .iter()
-            .map(|schpackt| schpackt.transaction.clone())
-            .collect();
+        banking_stage_stats
+            .receive_and_buffer_packets_elapsed
+            .fetch_add(recv_time, Ordering::Relaxed);
 
         let (process_transactions_summary, process_packets_transactions_us) = measure_us!(self
             .process_packets_transactions(
                 &bank_start.working_bank,
                 &bank_start.bank_creation_time,
-                &tx_array[..],
+                &sch_packets[..],
                 banking_stage_stats,
                 retry_sender,
                 slot_metrics_tracker,
+                consumed_buffered_packets_count,
             ));
 
-        *consumed_buffered_packets_count += process_transactions_summary.consumed_packets;
+        // *consumed_buffered_packets_count += process_transactions_summary.consumed_packets;
 
         slot_metrics_tracker
             .increment_process_packets_transactions_us(process_packets_transactions_us);
@@ -297,6 +301,7 @@ impl Consumer {
         banking_stage_stats: &BankingStageStats,
         retry_sender: &Sender<ControlObj>, // slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
+        consumed_buffered_packets_count: &mut usize,
     ) -> ProcessTransactionsSummary {
         let id = banking_stage_stats.id;
         let (mut process_transactions_summary, process_transactions_us) = measure_us!(self
@@ -305,9 +310,10 @@ impl Consumer {
                 bank_creation_time,
                 sanitized_transactions,
                 id,
-                retry_sender
+                retry_sender,
+                consumed_buffered_packets_count,
             ));
-        // slot_metrics_tracker.increment_process_transactions_us(process_transactions_us);
+        slot_metrics_tracker.increment_process_transactions_us(process_transactions_us);
         banking_stage_stats
             .transaction_processing_elapsed
             .fetch_add(process_transactions_us, Ordering::Relaxed);
@@ -319,9 +325,9 @@ impl Consumer {
             ..
         } = process_transactions_summary;
 
-        banking_stage_stats
-            .consumed_buffered_packets_count
-            .fetch_add(consumed_packets, Ordering::Relaxed);
+        // banking_stage_stats
+        //     .consumed_buffered_packets_count
+        //     .fetch_add(consumed_packets, Ordering::Relaxed);
 
         slot_metrics_tracker.accumulate_process_transactions_summary(&process_transactions_summary);
         slot_metrics_tracker.accumulate_transaction_errors(error_counters);
@@ -368,6 +374,7 @@ impl Consumer {
         transactions: &[SanitizedTransaction],
         id: u32,
         retry_sender: &Sender<ControlObj>,
+        consumed_buffered_packets_count: &mut usize,
     ) -> ProcessTransactionsSummary {
         // let mut chunk_start = 0;
         let mut all_retryable_tx_indexes = vec![];
@@ -392,7 +399,7 @@ impl Consumer {
         //         chunk_start + MAX_NUM_TRANSACTIONS_PER_BATCH,
         //     );
         let process_transaction_batch_output =
-            self.process_and_record_transactions(bank, &transactions[..], id, retry_sender);
+            self.process_and_record_transactions(bank, &transactions[..], id, retry_sender, consumed_buffered_packets_count);
 
         let ProcessTransactionBatchOutput {
             cost_model_throttled_transactions_count: new_cost_model_throttled_transactions_count,
@@ -463,6 +470,7 @@ impl Consumer {
         txs: &[SanitizedTransaction],
         id: u32,
         retry_sender: &Sender<ControlObj>,
+        consumed_buffered_packets_count: &mut usize,
     ) -> ProcessTransactionBatchOutput {
         let (
             (transaction_costs, transactions_qos_results, cost_model_throttled_transactions_count),
@@ -494,6 +502,7 @@ impl Consumer {
             // Once the accounts are new transactions can enter the pipeline to process them
             (_, unlock_us) = measure_us!(drop(batch));
 
+            *consumed_buffered_packets_count += execute_and_commit_transactions_output.consumed_tx;
             accumulative_execute_and_commit_transactions_output
                 .append(execute_and_commit_transactions_output);
         }
